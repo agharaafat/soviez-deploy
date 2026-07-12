@@ -46,10 +46,11 @@ curl -fsSL https://raw.githubusercontent.com/agharaafat/soviez-deploy/main/setup
 
 The installer:
 
-- Creates an immutable `.soviez.env` (container network identity, database password, dynamic host port from **8069** upward)
+- Creates an immutable `.soviez.env` (container network identity, Postgres password, **Database Master Password**, dynamic host port from **8069** upward)
 - Starts PostgreSQL with `POSTGRES_DB=postgres` only (no empty application schema)
-- Starts `soviez/soviez-erp:v18.0.1.01.0` **without** `POSTGRES_DB`, so Odoo does not bind to a broken empty database
+- Starts `soviez/soviez-erp:v18.0.1.01.0` **without** `POSTGRES_DB`, injecting `--admin-passwd` from `SOVIEZ_ADMIN_PASSWORD`
 - Prints the bound UI URL (for example `http://localhost:8071` when 8069 is already in use)
+- Prints a high-visibility **red console alert** with the Database Master Password on first install — save it immediately
 
 ### Access
 
@@ -58,7 +59,17 @@ The installer:
 | **Web UI** | `http://<your-server-ip>:${SOVIEZ_HOST_PORT}` |
 | **Image** | [`soviez/soviez-erp:v18.0.1.01.0`](https://hub.docker.com/r/soviez/soviez-erp) |
 
-**First boot:** navigate to the printed URL. Soviez ERP opens the interactive **Web Database Manager** so you can create a fresh database. After initialization, apply your perpetual activation key and proceed to Apps.
+**First boot:** navigate to the printed URL. Soviez ERP opens the interactive **Web Database Manager**. Enter the Master Password from the red alert (or `SOVIEZ_ADMIN_PASSWORD` in `.soviez.env`) to create a fresh database. After initialization, apply your perpetual activation key and proceed to Apps.
+
+### 🔑 Database Master Password Reset & Recovery
+
+Lost the Master Password? Rotate it without touching databases or volumes:
+
+```bash
+./setup.sh --recoverdbpass
+```
+
+This injects a fresh secure master key into `.soviez.env`, recycles only the `soviez-web` container, and displays the new token in a red console alert. Existing database configurations and Docker volumes are preserved.
 
 ### Manual `docker run` (equivalent topology)
 
@@ -75,7 +86,7 @@ docker run -d \
   -v soviez_db_data:/var/lib/postgresql/data \
   postgres:15-alpine
 
-# Soviez ERP — authenticate to the cluster; omit POSTGRES_DB entirely
+# Soviez ERP — authenticate to the cluster; omit POSTGRES_DB; inject master password
 docker run -d \
   --name soviez-web \
   --restart unless-stopped \
@@ -92,7 +103,8 @@ docker run -d \
     --db_port=5432 \
     --db_user=soviez \
     --db_password="${SOVIEZ_DB_PASSWORD}" \
-    --data-dir=/root/.local/share/Odoo
+    --data-dir=/root/.local/share/Odoo \
+    --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}"
 ```
 
 ---
