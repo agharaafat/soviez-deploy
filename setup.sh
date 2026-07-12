@@ -177,11 +177,14 @@ elif container_exists "${DB_CONTAINER}"; then
   docker start "${DB_CONTAINER}" >/dev/null
 else
   log_info "Launching PostgreSQL (${DB_CONTAINER}) on ${NETWORK_NAME}..."
+  # POSTGRES_DB=postgres: do NOT pre-create an empty application schema.
+  # An empty named DB (e.g. soviez) makes Odoo treat it as an instance and
+  # crash with KeyError: 'ir.http'. Operators create DBs via the Web Manager.
   docker run -d \
     --name "${DB_CONTAINER}" \
     --restart unless-stopped \
     --network "${NETWORK_NAME}" \
-    -e POSTGRES_DB=soviez \
+    -e POSTGRES_DB=postgres \
     -e POSTGRES_USER=soviez \
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
@@ -191,13 +194,13 @@ fi
 
 log_info "Waiting for PostgreSQL readiness..."
 for _ in $(seq 1 30); do
-  if docker exec "${DB_CONTAINER}" pg_isready -U soviez -d soviez >/dev/null 2>&1; then
+  if docker exec "${DB_CONTAINER}" pg_isready -U soviez -d postgres >/dev/null 2>&1; then
     log_info "PostgreSQL is ready."
     break
   fi
   sleep 1
 done
-if ! docker exec "${DB_CONTAINER}" pg_isready -U soviez -d soviez >/dev/null 2>&1; then
+if ! docker exec "${DB_CONTAINER}" pg_isready -U soviez -d postgres >/dev/null 2>&1; then
   log_error "PostgreSQL did not become ready in time. Inspect: docker logs ${DB_CONTAINER}"
   exit 1
 fi
@@ -217,13 +220,14 @@ log_info "Launching Soviez ERP (${WEB_CONTAINER})..."
 log_info "Host publish map: ${SOVIEZ_HOST_PORT} → container 8069"
 log_info "Pinned MAC address: ${SOVIEZ_CONTAINER_MAC}"
 
+# Do not set POSTGRES_DB on the web container — Odoo must boot with an empty
+# database list and present the interactive Web Database Manager.
 docker run -d \
   --name "${WEB_CONTAINER}" \
   --restart unless-stopped \
   --network "${NETWORK_NAME}" \
   --mac-address "${SOVIEZ_CONTAINER_MAC}" \
   -p "${SOVIEZ_HOST_PORT}:8069" \
-  -e POSTGRES_DB=soviez \
   -e POSTGRES_USER=soviez \
   -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
   -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
@@ -239,4 +243,5 @@ docker run -d \
 log_info "Cluster launch complete."
 log_info "UI: http://localhost:${SOVIEZ_HOST_PORT}"
 log_info "    http://<your-server-ip>:${SOVIEZ_HOST_PORT}"
+log_info "First boot: open the URL to use the interactive Web Database Manager."
 log_info "Environment locked at: $(pwd)/${ENV_FILE}"

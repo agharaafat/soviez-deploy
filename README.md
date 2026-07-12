@@ -47,7 +47,8 @@ curl -fsSL https://raw.githubusercontent.com/agharaafat/soviez-deploy/main/setup
 The installer:
 
 - Creates an immutable `.soviez.env` (container network identity, database password, dynamic host port from **8069** upward)
-- Starts PostgreSQL and the `soviez/soviez-erp:v18.0.1.01.0` application stack
+- Starts PostgreSQL with `POSTGRES_DB=postgres` only (no empty application schema)
+- Starts `soviez/soviez-erp:v18.0.1.01.0` **without** `POSTGRES_DB`, so Odoo does not bind to a broken empty database
 - Prints the bound UI URL (for example `http://localhost:8071` when 8069 is already in use)
 
 ### Access
@@ -57,7 +58,42 @@ The installer:
 | **Web UI** | `http://<your-server-ip>:${SOVIEZ_HOST_PORT}` |
 | **Image** | [`soviez/soviez-erp:v18.0.1.01.0`](https://hub.docker.com/r/soviez/soviez-erp) |
 
-After first boot, open the database manager, apply your perpetual activation key, and proceed to Apps.
+**First boot:** navigate to the printed URL. Soviez ERP opens the interactive **Web Database Manager** so you can create a fresh database. After initialization, apply your perpetual activation key and proceed to Apps.
+
+### Manual `docker run` (equivalent topology)
+
+```bash
+# PostgreSQL — maintenance DB only (do not pre-create an empty "soviez" schema)
+docker run -d \
+  --name soviez-db \
+  --restart unless-stopped \
+  --network soviez_network \
+  -e POSTGRES_DB=postgres \
+  -e POSTGRES_USER=soviez \
+  -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+  -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+  -v soviez_db_data:/var/lib/postgresql/data \
+  postgres:15-alpine
+
+# Soviez ERP — authenticate to the cluster; omit POSTGRES_DB entirely
+docker run -d \
+  --name soviez-web \
+  --restart unless-stopped \
+  --network soviez_network \
+  --mac-address "${SOVIEZ_CONTAINER_MAC}" \
+  -p "${SOVIEZ_HOST_PORT}:8069" \
+  -e POSTGRES_USER=soviez \
+  -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+  -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+  -v soviez_filestore:/root/.local/share/Odoo/filestore \
+  soviez/soviez-erp:v18.0.1.01.0 \
+  python3 soviez-bin -c soviez.conf \
+    --db_host=soviez-db \
+    --db_port=5432 \
+    --db_user=soviez \
+    --db_password="${SOVIEZ_DB_PASSWORD}" \
+    --data-dir=/root/.local/share/Odoo
+```
 
 ---
 
