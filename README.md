@@ -36,6 +36,34 @@ Include your intended deployment region and approximate user scale so we can iss
 
 ---
 
+## 🎛️ Production System Requirements
+
+### 1. Hardware Minimum Specifications
+
+- **CPU**: 2 vCPUs minimum (4 vCPUs recommended for >20 concurrent users).
+- **RAM**: 4 GB RAM baseline + 2 GB Swap space minimum.
+- **Storage**: 20 GB SSD/NVMe free space (excluding OS and filestore growth).
+- **OS**: Linux (Ubuntu 22.04/24.04 LTS or Debian 11/12 recommended) with Docker Engine installed.
+
+### 🔒 2. Mandatory SSL & Reverse Proxy Infrastructure
+
+Because Soviez ERP operates on a strict, hardened secure cookie architecture (`secure=True`, `HttpOnly`, `SameSite=Lax`), **the system WILL NOT retain login sessions over unencrypted HTTP or raw IP connections.**
+
+> **Critical:** Deploying against plain `http://` or a bare IP address will appear to “log in” and then immediately drop the session. Production traffic **must** terminate TLS at a reverse proxy before reaching the application container.
+
+- **Domain Name**: A valid fully qualified domain name (FQDN) is highly recommended.
+- **Reverse Proxy**: You **MUST** deploy the container behind a Reverse Proxy (such as Nginx, Traefik, or Apache) acting as a TLS terminator.
+- **SSL Certificate**: A valid SSL/TLS certificate (e.g., via Let's Encrypt / Certbot) must be installed on the reverse proxy to encapsulate all traffic.
+
+### 🔑 3. Commercial Licensing
+
+Soviez ERP is a locked commercial platform. Running this stack requires a valid, node-bound license signature.
+
+- To procure or renew a valid instance key, visit the official pricing console at: [soviez.com/pricing](https://soviez.com/pricing).
+- Unlicensed instances will fail-closed and restrict backend workflow operations until a cryptographically verified signature is bound via the software activation assistant.
+
+---
+
 ## Instant Setup
 
 On any Docker Engine 24+ host, run the public bootstrap wrapper:
