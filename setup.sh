@@ -11,7 +11,7 @@ set -euo pipefail
 
 readonly APP_IMAGE="soviez/soviez-erp:latest"
 readonly DB_IMAGE="postgres:latest"
-readonly UPGRADE_MODULES="base,local_license_guard,mail,web,web_enterprise,soviez_web_ui"
+readonly UPGRADE_MODULES="base,local_license_guard,mail,web,web_enterprise,soviez_web_ui,web_studio"
 readonly PORT_SCAN_MAX=8999
 readonly PRIMARY_PORT_START=8069
 readonly MULTI_PORT_START=8073
@@ -106,7 +106,36 @@ resolve_instance_root() {
   printf '%s\n' "$(pwd)"
 }
 
+resolve_host_soviez_dir() {
+  # Host-side security ledger (~/.soviez) — must persist across container recycles.
+  if [[ -n "${SOVIEZ_HOST_LEDGER_DIR:-}" ]]; then
+    printf '%s\n' "${SOVIEZ_HOST_LEDGER_DIR}"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    printf '%s\n' "${HOME}/.soviez"
+    return 0
+  fi
+  if [[ -d /root ]]; then
+    printf '%s\n' "/root/.soviez"
+    return 0
+  fi
+  printf '%s\n' "$(pwd)/.soviez"
+}
+
 INSTANCE_ROOT="$(resolve_instance_root)"
+HOST_SOVIEZ_DIR="$(resolve_host_soviez_dir)"
+
+ensure_host_ledger_dir() {
+  # CRITICAL: create hardened host ledger before any container spawn so
+  # .shadow_lock / .deployment_ledger survive --update / recreate cycles.
+  mkdir -p "${HOST_SOVIEZ_DIR}"
+  chmod 700 "${HOST_SOVIEZ_DIR}"
+  log_info "Host security ledger ready: ${HOST_SOVIEZ_DIR} → /root/.soviez (mode 700)"
+}
+
+# Initialize host ledger immediately — before any docker run / compose path.
+ensure_host_ledger_dir
 
 # ---------------------------------------------------------------------------
 # Port occupancy probe — ss → netstat → bash /dev/tcp
@@ -356,6 +385,9 @@ launch_web_container() {
   log_info "Host publish map: ${SOVIEZ_HOST_PORT} → container 8069"
   log_info "Pinned MAC address: ${SOVIEZ_CONTAINER_MAC}"
   log_info "DB host (cluster DNS): ${DB_CONTAINER}"
+  log_info "Security ledger bind: ${HOST_SOVIEZ_DIR} → /root/.soviez"
+
+  ensure_host_ledger_dir
 
   # Do not set POSTGRES_DB on the web container — Odoo must boot with an empty
   # database list and present the interactive Web Database Manager.
@@ -369,8 +401,9 @@ launch_web_container() {
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore" \
+    -v "${HOST_SOVIEZ_DIR}:/root/.soviez" \
     "${APP_IMAGE}" \
-    python3 soviez-bin -c soviez.conf \
+    python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
       --db_host="${DB_CONTAINER}" \
       --db_port=5432 \
       --db_user=soviez \
@@ -391,10 +424,33 @@ list_odoo_databases() {
     2>/dev/null | sed '/^$/d' || true
 }
 
+purge_frontend_assets() {
+  # Force libsass / web.assets_* recompile so premium login SCSS and UI bundles
+  # are never served stale after --update.
+  local dbname="$1"
+  log_info "Purging compiled frontend assets for '${dbname}' (force layout recompile)..."
+  if ! docker exec "${DB_CONTAINER}" \
+    psql -U soviez -d "${dbname}" -v ON_ERROR_STOP=1 -c \
+    "DELETE FROM ir_attachment
+     WHERE url LIKE '/web/assets/%'
+        OR url LIKE '/web/content/%assets%'
+        OR name ILIKE 'web.assets_%'
+        OR name ILIKE 'web_enterprise.assets_%'
+        OR name ILIKE '%.assets_%.min.js'
+        OR name ILIKE '%.assets_%.min.css';" >/dev/null; then
+    log_error "Frontend asset purge failed for database '${dbname}'."
+    return 1
+  fi
+  log_info "Frontend asset cache cleared for '${dbname}'."
+}
+
 run_schema_upgrades() {
   local dbname
   local dbs
   local count=0
+  local upgrade_rc=0
+
+  ensure_host_ledger_dir
 
   mapfile -t dbs < <(list_odoo_databases)
   if ((${#dbs[@]} == 0)); then
@@ -405,26 +461,44 @@ run_schema_upgrades() {
 
   for dbname in "${dbs[@]}"; do
     [[ -z "${dbname}" ]] && continue
+    # Sanitize: allow only common Odoo DB name characters.
+    if [[ ! "${dbname}" =~ ^[A-Za-z0-9_:-]+$ ]]; then
+      log_error "Refusing to upgrade unsafe database name: ${dbname}"
+      return 1
+    fi
     count=$((count + 1))
     log_info "Running schema upgrade on database '${dbname}' (modules: ${UPGRADE_MODULES})..."
+    set +e
     docker run --rm \
       --network "${NETWORK_NAME}" \
+      --mac-address "${SOVIEZ_CONTAINER_MAC}" \
       -e POSTGRES_USER=soviez \
       -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore" \
+      -v "${HOST_SOVIEZ_DIR}:/root/.soviez" \
       "${APP_IMAGE}" \
-      python3 soviez-bin -c soviez.conf \
+      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
         --db_host="${DB_CONTAINER}" \
         --db_port=5432 \
         --db_user=soviez \
         --db_password="${SOVIEZ_DB_PASSWORD}" \
-        --data-dir=/tmp/soviez-upgrade-datadir \
+        --data-dir=/root/.local/share/Odoo \
+        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
         -d "${dbname}" \
         -u "${UPGRADE_MODULES}" \
         --stop-after-init
+    upgrade_rc=$?
+    set -e
+    if (( upgrade_rc != 0 )); then
+      log_error "Schema upgrade failed for '${dbname}' (exit ${upgrade_rc})."
+      log_error "Leaving live web runner untouched to avoid a corrupted cut-over."
+      return "${upgrade_rc}"
+    fi
     log_info "Schema upgrade finished for '${dbname}'."
+    purge_frontend_assets "${dbname}" || return 1
   done
 
-  log_info "Upgraded ${count} database(s)."
+  log_info "Upgraded ${count} database(s) with frontend asset purge."
 }
 
 require_complete_env() {
@@ -507,9 +581,13 @@ if [[ "${MODE}" == "update" ]]; then
   fi
   wait_for_postgres
 
-  run_schema_upgrades
+  log_info "Starting maintenance upgrade containers (live web runner stays up until success)..."
+  if ! run_schema_upgrades; then
+    log_error "Automated schema upgrade aborted — live '${WEB_CONTAINER}' was NOT recycled."
+    exit 1
+  fi
 
-  log_info "Tearing down old web runner '${WEB_CONTAINER}'..."
+  log_info "Maintenance upgrades clean — tearing down old web runner '${WEB_CONTAINER}'..."
   docker rm -f "${WEB_CONTAINER}" 2>/dev/null || true
 
   launch_web_container
@@ -518,6 +596,7 @@ if [[ "${MODE}" == "update" ]]; then
   log_info "UI: http://localhost:${SOVIEZ_HOST_PORT}"
   log_info "    http://<your-server-ip>:${SOVIEZ_HOST_PORT}"
   log_info "Environment: ${ENV_FILE}"
+  log_info "Security ledger: ${HOST_SOVIEZ_DIR}"
   exit 0
 fi
 
