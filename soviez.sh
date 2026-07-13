@@ -2,12 +2,12 @@
 # Soviez ERP — production onboarding wizard (Ubuntu/Debian)
 #
 # Modes:
-#   ./setup.sh            | --init    Host environment bootstrap (apt, Docker, Nginx, Certbot, UFW)
-#   ./setup.sh --new                  Provision isolated multi-tenant instance + DNS/SSL/addons
-#   ./setup.sh --formsetup            Resume / heal the latest half-configured tenant (idempotent)
-#   ./setup.sh --formssl [domain]     Diagnose / repair tenant HTTPS (LE or self-signed Cloudflare Full)
-#   ./setup.sh --update               Pull soviez/soviez-erp:latest and recycle web runners
-#   ./setup.sh --recoverdbpass        Rotate Database Master Password (primary / indexed via env)
+#   ./soviez.sh            | --init    Host environment bootstrap (apt, Docker, Nginx, Certbot, UFW)
+#   ./soviez.sh --new                  Provision isolated multi-tenant instance + DNS/SSL/addons
+#   ./soviez.sh --formsetup            Resume / heal the latest half-configured tenant (idempotent)
+#   ./soviez.sh --formssl [domain]     Diagnose / repair tenant HTTPS (LE or self-signed Cloudflare Full)
+#   ./soviez.sh --update               Pull soviez/soviez-erp:latest and recycle web runners
+#   ./soviez.sh --recoverdbpass        Rotate Database Master Password (primary / indexed via env)
 #
 # Logs: /var/log/soviez_setup.log (verbose); terminal shows clean status UI only.
 set -euo pipefail
@@ -78,13 +78,13 @@ for arg in "$@"; do
 Soviez ERP — production onboarding wizard
 
 Usage:
-  ./setup.sh [--init]              Bootstrap host (apt, Docker, Nginx, Certbot, UFW)
-  ./setup.sh --new                 Provision a new isolated tenant (domain + SSL + addons)
-  ./setup.sh --formsetup           Resume / heal latest half-configured tenant (idempotent)
-  ./setup.sh --formssl [domain]    Diagnose / repair HTTPS (Let's Encrypt or self-signed)
-  ./setup.sh --update              Pull latest ERP image and recycle web containers
-  ./setup.sh --recoverdbpass       Rotate Database Master Password
-  ./setup.sh --help                Show this help
+  ./soviez.sh [--init]              Bootstrap host (apt, Docker, Nginx, Certbot, UFW)
+  ./soviez.sh --new                 Provision a new isolated tenant (domain + SSL + addons)
+  ./soviez.sh --formsetup           Resume / heal latest half-configured tenant (idempotent)
+  ./soviez.sh --formssl [domain]    Diagnose / repair HTTPS (Let's Encrypt or self-signed)
+  ./soviez.sh --update              Pull latest ERP image and recycle web containers
+  ./soviez.sh --recoverdbpass       Rotate Database Master Password
+  ./soviez.sh --help                Show this help
 
 Images:
   soviez/soviez-erp:latest
@@ -101,7 +101,7 @@ USAGE
       ;;
     -*)
       echo "[ERROR] Unknown argument: ${arg}" >&2
-      echo "[ERROR] Try: ./setup.sh --help" >&2
+      echo "[ERROR] Try: ./soviez.sh --help" >&2
       exit 1
       ;;
     *)
@@ -109,7 +109,7 @@ USAGE
         FORMSSL_DOMAIN="${arg}"
       else
         echo "[ERROR] Unknown argument: ${arg}" >&2
-        echo "[ERROR] Try: ./setup.sh --help" >&2
+        echo "[ERROR] Try: ./soviez.sh --help" >&2
         exit 1
       fi
       ;;
@@ -150,7 +150,7 @@ ui_wait()  { echo -e "${C_BLUE}[WAIT]${C_RESET} $*"; log_file "WAIT  $*"; }
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    ui_error "This mode requires root. Re-run with: sudo ./setup.sh $*"
+    ui_error "This mode requires root. Re-run with: sudo ./soviez.sh $*"
     exit 1
   fi
 }
@@ -240,7 +240,7 @@ print_master_password_alert() {
   echo -e "${C_RED}${C_BOLD}!!  ${password}${C_RESET}"
   echo -e "${C_RED}${C_BOLD}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
   echo -e "${C_RED}Copy and vault this password now. Required for the Web Database Manager.${C_RESET}"
-  echo -e "${C_DIM}Recover later: sudo ./setup.sh --recoverdbpass${C_RESET}"
+  echo -e "${C_DIM}Recover later: sudo ./soviez.sh --recoverdbpass${C_RESET}"
   echo ""
 }
 
@@ -663,7 +663,7 @@ They are mounted read/write into the container at:
   ${CUSTOM_ADDONS_CONTAINER_PATH}
 
 After dropping a module, update the database apps list from the UI
-or run: sudo ./setup.sh --update
+or run: sudo ./soviez.sh --update
 EOF
   fi
 }
@@ -904,7 +904,7 @@ dns_validation_loop() {
         return 0
         ;;
       *)
-        ui_error "DNS not verified. Exiting. Re-run ./setup.sh --new when ready."
+        ui_error "DNS not verified. Exiting. Re-run ./soviez.sh --new when ready."
         exit 1
         ;;
     esac
@@ -1169,7 +1169,7 @@ provision_tenant_https() {
   ui_ok "Baseline HTTPS site live on :443 (self-signed)"
 
   if ! command -v certbot >/dev/null 2>&1; then
-    ui_warn "Certbot not installed — keeping self-signed HTTPS. Run: sudo ./setup.sh --init"
+    ui_warn "Certbot not installed — keeping self-signed HTTPS. Run: sudo ./soviez.sh --init"
     SSL_STATUS="selfsigned"
     return 0
   fi
@@ -1330,11 +1330,11 @@ BANNER
   echo ""
   echo -e "  ${C_BOLD}Custom addons folder${C_RESET}"
   echo -e "     ${C_CYAN}${addons_path}${C_RESET}"
-  echo -e "     ${C_DIM}Drop Odoo modules here, then refresh Apps or run ./setup.sh --update${C_RESET}"
+  echo -e "     ${C_DIM}Drop Odoo modules here, then refresh Apps or run ./soviez.sh --update${C_RESET}"
   print_ssl_status_report "${domain}" "${SSL_STATUS:-}"
   if [[ "${SSL_STATUS:-}" == "selfsigned" ]]; then
     echo -e "  ${C_YELLOW}⚠️  SSL Note: Using Cloudflare? Ensure your Cloudflare SSL/TLS encryption mode is set to 'Full' so your site opens securely immediately!${C_RESET}"
-    echo -e "  ${C_DIM}Re-attempt Let's Encrypt later: sudo ./setup.sh --formssl ${domain}${C_RESET}"
+    echo -e "  ${C_DIM}Re-attempt Let's Encrypt later: sudo ./soviez.sh --formssl ${domain}${C_RESET}"
     echo ""
   fi
   print_master_password_alert \
@@ -1355,7 +1355,7 @@ mode_init() {
   print_border_box "Soviez ERP — Host Initialization" \
     "Preparing a production-ready Ubuntu/Debian appliance." \
     "Containers are NOT launched in this mode." \
-    "After success, provision tenants with: ./setup.sh --new"
+    "After success, provision tenants with: ./soviez.sh --new"
 
   show_progress "Updating system components..." bash -c \
     'apt-get update -y && apt-get upgrade -y' || {
@@ -1383,7 +1383,7 @@ mode_init() {
 
   print_green_success "Host environment successfully initialized!"
   echo -e "  You can now provision instances using:"
-  echo -e "    ${C_BOLD}sudo ./setup.sh --new${C_RESET}"
+  echo -e "    ${C_BOLD}sudo ./soviez.sh --new${C_RESET}"
   echo -e "  Log file: ${C_DIM}${LOG_FILE}${C_RESET}"
   echo ""
 }
@@ -1399,7 +1399,7 @@ mode_new() {
   ensure_host_ledger_dir
 
   if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
-    ui_error "Host not initialized. Run first: sudo ./setup.sh --init"
+    ui_error "Host not initialized. Run first: sudo ./soviez.sh --init"
     exit 1
   fi
 
@@ -1485,14 +1485,14 @@ mode_formsetup() {
   ensure_host_ledger_dir
 
   if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
-    ui_error "Host not initialized. Run first: sudo ./setup.sh --init"
+    ui_error "Host not initialized. Run first: sudo ./soviez.sh --init"
     exit 1
   fi
 
   local target_index
   target_index="$(select_formsetup_index)"
   if (( target_index < 1 )); then
-    ui_error "No tenant environment sheet found. Provision with: sudo ./setup.sh --new"
+    ui_error "No tenant environment sheet found. Provision with: sudo ./soviez.sh --new"
     exit 1
   fi
 
@@ -1560,7 +1560,7 @@ mode_formssl() {
   require_cmd openssl
 
   if ! command -v nginx >/dev/null 2>&1; then
-    ui_error "Nginx not installed. Run first: sudo ./setup.sh --init"
+    ui_error "Nginx not installed. Run first: sudo ./soviez.sh --init"
     exit 1
   fi
 
@@ -1582,7 +1582,7 @@ mode_formssl() {
       target_index="$(find_highest_instance_index)"
     fi
     if (( target_index < 1 )); then
-      ui_error "No tenant found. Provision with: sudo ./setup.sh --new"
+      ui_error "No tenant found. Provision with: sudo ./soviez.sh --new"
       exit 1
     fi
     apply_topology_indexed "${target_index}"
@@ -1655,7 +1655,7 @@ mode_formssl() {
     echo -e "  ${C_YELLOW}Self-Signed setup optimized for Cloudflare Full mode.${C_RESET}"
     echo -e "  ${C_YELLOW}⚠️  SSL Note: Using Cloudflare? Ensure your Cloudflare SSL/TLS encryption mode is set to 'Full' so your site opens securely immediately!${C_RESET}"
     echo -e "  ${C_DIM}Tip: Switch Cloudflare to DNS-only (grey cloud) temporarily, then re-run:${C_RESET}"
-    echo -e "    ${C_BOLD}sudo ./setup.sh --formssl ${domain}${C_RESET}"
+    echo -e "    ${C_BOLD}sudo ./soviez.sh --formssl ${domain}${C_RESET}"
   fi
   echo -e "  ${C_DIM}Log: ${LOG_FILE}${C_RESET}"
   echo ""
@@ -1689,7 +1689,7 @@ mode_update() {
   done
 
   if ((${#env_files[@]} == 0)); then
-    ui_error "No Soviez environments found. Provision one with: sudo ./setup.sh --new"
+    ui_error "No Soviez environments found. Provision one with: sudo ./soviez.sh --new"
     exit 1
   fi
 

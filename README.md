@@ -51,9 +51,9 @@ Because Soviez ERP operates on a strict, hardened secure cookie architecture (`s
 
 > **Critical:** Deploying against plain `http://` or a bare IP address will appear to “log in” and then immediately drop the session. Production traffic **must** terminate TLS at a reverse proxy before reaching the application container.
 
-The official installer configures **Nginx + HTTPS** when you provision a tenant with `./setup.sh --new`. You need a domain whose DNS points at your server.
+The official installer configures **Nginx + HTTPS** when you provision a tenant with `./soviez.sh --new`. You need a domain whose DNS points at your server.
 
-The wizard always binds **port 443** immediately (self-signed baseline), then upgrades to Let's Encrypt when Certbot can reach the host. If Certbot fails (common with Cloudflare proxied 🟠 records), HTTPS stays online on the self-signed cert — set Cloudflare SSL/TLS to **Full**. Repair later with `./setup.sh --formssl`.
+The wizard always binds **port 443** immediately (self-signed baseline), then upgrades to Let's Encrypt when Certbot can reach the host. If Certbot fails (common with Cloudflare proxied 🟠 records), HTTPS stays online on the self-signed cert — set Cloudflare SSL/TLS to **Full**. Repair later with `./soviez.sh --formssl`.
 
 - **Domain Name**: A valid FQDN is required for production HTTPS sessions.
 - **Reverse Proxy / SSL**: Handled by the wizard (Nginx + Certbot / self-signed fallback), or any equivalent TLS terminator you operate.
@@ -72,30 +72,30 @@ Soviez ERP is a locked commercial platform. Running this stack requires a valid,
 On Ubuntu/Debian, download the public bootstrap wizard and run the **two-step** production flow:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/agharaafat/soviez-deploy/main/setup.sh -o setup.sh
-chmod +x setup.sh
+curl -fsSL https://raw.githubusercontent.com/agharaafat/soviez-deploy/main/soviez.sh -o soviez.sh
+chmod +x soviez.sh
 
 # 1) Prepare the host (Docker, Nginx, Certbot, firewall) — no ERP containers yet
-sudo ./setup.sh --init
+sudo ./soviez.sh --init
 
 # 2) Point your domain’s DNS A/AAAA record at this server, then provision the live tenant
-sudo ./setup.sh --new
+sudo ./soviez.sh --new
 
 # 2b) If provisioning failed mid-flight on Nginx/SSL, heal and resume:
-sudo ./setup.sh --formsetup
+sudo ./soviez.sh --formsetup
 
 # 2c) HTTPS-only repair (Cloudflare / Let's Encrypt retry):
-sudo ./setup.sh --formssl
+sudo ./soviez.sh --formssl
 ```
 
 | Mode | Command | Role |
 |------|---------|------|
-| **Init** | `./setup.sh --init` (default) | Apt, Docker, Nginx, Certbot, UFW — host only |
-| **New** | `./setup.sh --new` | Domain + DNS check + isolated ERP/Postgres stack + HTTPS |
-| **Form setup** | `./setup.sh --formsetup` | Resume / heal the latest half-configured tenant (idempotent) |
-| **Form SSL** | `./setup.sh --formssl [domain]` | Diagnose / repair HTTPS (Let's Encrypt or self-signed) |
-| **Update** | `./setup.sh --update` | Pull latest ERP image and upgrade schemas |
-| **Recover** | `./setup.sh --recoverdbpass` | Rotate Database Master Password |
+| **Init** | `./soviez.sh --init` (default) | Apt, Docker, Nginx, Certbot, UFW — host only |
+| **New** | `./soviez.sh --new` | Domain + DNS check + isolated ERP/Postgres stack + HTTPS |
+| **Form setup** | `./soviez.sh --formsetup` | Resume / heal the latest half-configured tenant (idempotent) |
+| **Form SSL** | `./soviez.sh --formssl [domain]` | Diagnose / repair HTTPS (Let's Encrypt or self-signed) |
+| **Update** | `./soviez.sh --update` | Pull latest ERP image and upgrade schemas |
+| **Recover** | `./soviez.sh --recoverdbpass` | Rotate Database Master Password |
 
 The installer:
 
@@ -125,7 +125,7 @@ Images:
 Lost the Master Password? Rotate it without touching databases or volumes:
 
 ```bash
-sudo ./setup.sh --recoverdbpass
+sudo ./soviez.sh --recoverdbpass
 ```
 
 This injects a fresh secure master key into the env sheet, recycles only the web container, and displays the new token. Existing databases and Docker volumes are preserved.
@@ -135,7 +135,7 @@ This injects a fresh secure master key into the env sheet, recycles only the web
 Track Hub ERP releases and migrate schemas in one command:
 
 ```bash
-sudo ./setup.sh --update
+sudo ./soviez.sh --update
 ```
 
 Pulls **`soviez/soviez-erp:latest`**, bind-mounts `~/.soviez` (mode 700), **stops web runners first** to release DB locks, upgrades every discovered database with `-u base,local_license_guard,mail,web,web_enterprise,soviez_web_ui --stop-after-init`, purges compiled `/web/assets/*` attachments, then relaunches web containers. Postgres stays on **`postgres:16`**. Volumes, MAC/port secrets, ledger tokens, and license bindings stay intact — no re-activation required for a normal upgrade.
@@ -145,7 +145,7 @@ Pulls **`soviez/soviez-erp:latest`**, bind-mounts `~/.soviez` (mode 700), **stop
 Spin parallel ERP clusters on one host:
 
 ```bash
-sudo ./setup.sh --new
+sudo ./soviez.sh --new
 ```
 
 Each run allocates the next index (`.soviez_1.env`, `.soviez_2.env`, …), creates sandboxed network/volume/container names, prepares `/etc/soviez_web_N/addons`, binds a free port from **8073**, validates DNS for your domain, issues TLS, and flashes the new Master Password.
@@ -155,7 +155,7 @@ Each run allocates the next index (`.soviez_1.env`, `.soviez_2.env`, …), creat
 If `--new` stopped after writing secrets/containers but before HTTPS was fully online:
 
 ```bash
-sudo ./setup.sh --formsetup
+sudo ./soviez.sh --formsetup
 ```
 
 Resumes the latest half-configured tenant idempotently (keeps volumes, starts stopped containers, rewrites Nginx + HTTPS, reprints the welcome banner and Master Password). Safe to re-run.
@@ -163,8 +163,8 @@ Resumes the latest half-configured tenant idempotently (keeps volumes, starts st
 ### 🔐 Form SSL — Fix HTTPS (Cloudflare / Let's Encrypt)
 
 ```bash
-sudo ./setup.sh --formssl
-sudo ./setup.sh --formssl erp.example.com
+sudo ./soviez.sh --formssl
+sudo ./soviez.sh --formssl erp.example.com
 ```
 
 Diagnoses the tenant vhost, retries Let's Encrypt, and if Certbot still fails keeps a self-signed `:443` cert so the site stays reachable with Cloudflare SSL set to **Full**. Never leaves the domain on HTTP-only (which lets other host panels capture HTTPS).
