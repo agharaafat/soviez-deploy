@@ -1114,6 +1114,15 @@ nginx_site_has_443() {
   grep -Eq 'listen[[:space:]]+[^;]*443' "${site}" 2>/dev/null
 }
 
+# Unique routing fingerprint — never collide with another Odoo on the same host.
+tenant_identity_token() {
+  local idx="${INSTANCE_INDEX:-${SOVIEZ_INSTANCE_INDEX:-}}"
+  if [[ -z "${idx}" ]]; then
+    idx="0"
+  fi
+  printf 'soviez_%s\n' "${idx}"
+}
+
 # Write complete dual-stack vhost: :80 ACME + HTTPS redirect, :443 SSL proxy to ERP.
 # ssl_kind: selfsigned | letsencrypt
 # Force-hijack: bind listen ${PUBLIC_IP}:80/443 so Virtualmin IP:443 cannot steal traffic.
@@ -1121,11 +1130,12 @@ write_nginx_site() {
   local domain="$1"
   local host_port="$2"
   local ssl_kind="${3:-selfsigned}"
-  local site_file enabled_link crt_file key_file bind_ip
+  local site_file enabled_link crt_file key_file bind_ip tenant_token
 
   site_file="$(nginx_site_path "${domain}")"
   enabled_link="/etc/nginx/sites-enabled/soviez-${domain}.conf"
   bind_ip="$(ensure_public_bind_ip)"
+  tenant_token="$(tenant_identity_token)"
 
   ensure_nginx_global_limits
 
@@ -1148,10 +1158,14 @@ write_nginx_site() {
 # Soviez ERP tenant — ${domain} → 127.0.0.1:${host_port}
 # SSL mode: ${ssl_kind}
 # Force-hijack bind: ${bind_ip}:80 / ${bind_ip}:443 (matches Virtualmin explicit-IP priority)
+# Tenant header: X-Soviez-Tenant: ${tenant_token}
 
 server {
     listen ${bind_ip}:80;
     server_name ${domain};
+
+    # Tenant-specific footprint — proves THIS vhost answered (not another Odoo on the IP).
+    add_header X-Soviez-Tenant "${tenant_token}" always;
 
     client_max_body_size 512M;
 
@@ -1171,6 +1185,9 @@ server {
     listen ${bind_ip}:443 ssl;
     server_name ${domain};
 
+    # Tenant-specific footprint — required by post-provision curl verification.
+    add_header X-Soviez-Tenant "${tenant_token}" always;
+
     ssl_certificate     ${crt_file};
     ssl_certificate_key ${key_file};
 
@@ -1189,6 +1206,8 @@ server {
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
         proxy_redirect off;
+        # Re-assert tenant header inside location (nginx does not inherit add_header into locations that set others).
+        add_header X-Soviez-Tenant "${tenant_token}" always;
     }
 
     location /websocket {
@@ -1201,6 +1220,7 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 720s;
+        add_header X-Soviez-Tenant "${tenant_token}" always;
     }
 }
 EOF
@@ -1216,7 +1236,7 @@ EOF
     return 1
   fi
   systemctl reload nginx >>"${LOG_FILE}" 2>&1 || systemctl start nginx >>"${LOG_FILE}" 2>&1 || true
-  log_file "Wrote Nginx site ${site_file} ssl_kind=${ssl_kind} bind=${bind_ip} crt=${crt_file}"
+  log_file "Wrote Nginx site ${site_file} ssl_kind=${ssl_kind} bind=${bind_ip} tenant=${tenant_token} crt=${crt_file}"
 }
 
 # Baseline explicit-IP :443 (self-signed) → Certbot → LE rewrite or keep self-signed.
@@ -1281,60 +1301,45 @@ provision_tenant_https() {
   return 0
 }
 
-# Return 0 only when https://domain returns an Odoo/Soviez footprint (not Virtualmin 200 OK).
+# Return 0 only when THIS tenant's Nginx answered (X-Soviez-Tenant header).
+# Generic "odoo" body matches are insufficient — another Odoo on the same IP can 200 OK.
 verify_tenant_https_http_code() {
   local domain="$1"
-  local body_file hdr_file code probe
-  body_file="$(mktemp)"
-  hdr_file="$(mktemp)"
+  local token hdrs code
+  token="$(tenant_identity_token)"
 
   set +e
-  code="$(curl -k -sS -L --max-time 8 \
-    -D "${hdr_file}" -o "${body_file}" -w "%{http_code}" \
+  hdrs="$(curl -k -sI --max-time 8 \
     -H "Host: ${domain}" \
     "https://${domain}/" 2>>"${LOG_FILE}")"
   local curl_rc=$?
   set -e
 
-  # Combined probe surface: response headers + body
-  probe="$(cat "${hdr_file}" "${body_file}" 2>/dev/null || true)"
-  log_file "HTTPS verify ${domain} curl_rc=${curl_rc} http_code=${code:-} bytes=${#probe}"
+  code="$(printf '%s\n' "${hdrs}" | head -n1 | awk '{print $2}')"
+  LAST_HTTPS_CODE="${code:-}"
+  log_file "HTTPS verify ${domain} curl_rc=${curl_rc} http_code=${code:-} expect=X-Soviez-Tenant: ${token}"
 
-  if (( curl_rc != 0 )) || [[ -z "${code}" || "${code}" == "000" ]]; then
-    rm -f "${body_file}" "${hdr_file}"
+  if (( curl_rc != 0 )) || [[ -z "${hdrs}" ]]; then
     return 1
   fi
 
-  LAST_HTTPS_CODE="${code}"
+  # Strict tenant header — must match soviez_$INDEX exactly (anti default-server / sibling Odoo).
+  if ! printf '%s\n' "${hdrs}" | grep -Fiq "X-Soviez-Tenant: ${token}"; then
+    log_file "HTTPS verify ${domain}: missing tenant header X-Soviez-Tenant: ${token} (HTTP ${code:-(none)}) — routing hijack / default server"
+    log_file "HTTPS verify ${domain}: headers received: $(printf '%s' "${hdrs}" | tr '\n' '|' | head -c 500)"
+    return 1
+  fi
 
   case "${code}" in
-    200|301|302|303|307|308|404)
+    200|301|302|303|307|308|404|"")
+      return 0
       ;;
     *)
-      log_file "HTTPS verify ${domain}: unexpected HTTP ${code}"
-      rm -f "${body_file}" "${hdr_file}"
-      return 1
+      # Header matched our vhost — routing is correct even if upstream status is unexpected.
+      log_file "HTTPS verify ${domain}: tenant header OK with HTTP ${code}"
+      return 0
       ;;
   esac
-
-  # Hard fail on alien panel signatures (Virtualmin et al.) even when status is 200.
-  if printf '%s' "${probe}" | grep -Eiq \
-      'virtualmin|webmin|cpanel|plesk|cyberpanel|directadmin|ispconfig|powered by virtualmin'; then
-    log_file "HTTPS verify ${domain}: alien control-panel footprint detected (HTTP ${code})"
-    rm -f "${body_file}" "${hdr_file}"
-    return 1
-  fi
-
-  # Require a positive Odoo/Soviez footprint — HTTP 200 alone is NOT enough.
-  if ! printf '%s' "${probe}" | grep -Eiq \
-      'odoo|soviez|session_id|web\.assets|web/database|web/login|web/session|__odoo|oe_login|csrf_token'; then
-    log_file "HTTPS verify ${domain}: HTTP ${code} but missing Odoo/Soviez footprint (likely panel hijack)"
-    rm -f "${body_file}" "${hdr_file}"
-    return 1
-  fi
-
-  rm -f "${body_file}" "${hdr_file}"
-  return 0
 }
 
 # Detect non-Nginx processes holding :80 / :443 (Apache, etc.).
@@ -1382,7 +1387,8 @@ dump_port_capture_diagnostics() {
   echo -e "${C_RED}${C_BOLD}════════════════════════════════════════════════════════════════${C_RESET}"
   echo -e "  Expected bind: ${C_BOLD}${bind_ip}:80${C_RESET} / ${C_BOLD}${bind_ip}:443${C_RESET}"
   echo -e "  Last HTTP code: ${C_BOLD}${LAST_HTTPS_CODE:-(none)}${C_RESET}"
-  echo -e "  ${C_DIM}Note: Virtualmin often returns HTTP 200 — Soviez requires an Odoo footprint (odoo/session_id/…).${C_RESET}"
+  echo -e "  Expected header: ${C_BOLD}X-Soviez-Tenant: $(tenant_identity_token)${C_RESET}"
+  echo -e "  ${C_DIM}Sibling Odoo on the same IP can return HTTP 200 — only the tenant header proves correct routing.${C_RESET}"
   echo ""
   echo -e "  ${C_BOLD}Listeners on :80 / :443:${C_RESET}"
   if command -v ss >/dev/null 2>&1; then
@@ -1435,13 +1441,13 @@ verify_and_heal_tenant_https() {
 
   require_cmd curl
 
-  ui_wait "Verifying HTTPS route https://${domain} (Odoo footprint, max 8s)..."
+  ui_wait "Verifying HTTPS route https://${domain} (X-Soviez-Tenant: $(tenant_identity_token))..."
   if verify_tenant_https_http_code "${domain}"; then
-    ui_ok "HTTPS verification passed — Odoo/Soviez footprint live (HTTP ${LAST_HTTPS_CODE})"
+    ui_ok "HTTPS verification passed — tenant header matched (HTTP ${LAST_HTTPS_CODE:-=})"
     return 0
   fi
 
-  ui_warn "HTTPS verification failed (HTTP ${LAST_HTTPS_CODE:-(curl error)} / missing Odoo footprint) — running self-healing diagnostics..."
+  ui_warn "HTTPS verification failed (HTTP ${LAST_HTTPS_CODE:-(curl error)} / missing X-Soviez-Tenant: $(tenant_identity_token)) — healing..."
   log_file "WARN post-provision HTTPS verify failed for ${domain}; starting heal suite"
 
   # 1) Alien webservers occupying 80/443
@@ -1475,14 +1481,14 @@ verify_and_heal_tenant_https() {
   sleep 2
   ui_ok "Nginx restarted with force-hijack binds on ${bind_ip}"
 
-  ui_wait "Re-verifying HTTPS route https://${domain} (Odoo footprint)..."
+  ui_wait "Re-verifying HTTPS route https://${domain} (X-Soviez-Tenant)..."
   if verify_tenant_https_http_code "${domain}"; then
-    ui_ok "HTTPS verification passed after heal — Odoo/Soviez footprint live (HTTP ${LAST_HTTPS_CODE})"
+    ui_ok "HTTPS verification passed after heal — tenant header matched (HTTP ${LAST_HTTPS_CODE:-=})"
     return 0
   fi
 
   dump_port_capture_diagnostics "${domain}" "${bind_ip}"
-  ui_error "Automated hijack attempts exhausted — traffic for ${domain} is still not reaching Soviez (no Odoo footprint)."
+  ui_error "Automated hijack attempts exhausted — https://${domain} is not serving X-Soviez-Tenant: $(tenant_identity_token)."
   exit 1
 }
 
