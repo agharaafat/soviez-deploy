@@ -999,6 +999,44 @@ ssl_le_privkey_path() {
   printf '%s\n' "/etc/letsencrypt/live/${1}/privkey.pem"
 }
 
+# Guarantee Certbot's nginx authenticator/installer plugin is present and loadable.
+ensure_certbot_nginx_plugin() {
+  export DEBIAN_FRONTEND=noninteractive
+  ui_wait "Ensuring Certbot nginx plugin (python3-certbot-nginx)..."
+  if ! command -v certbot >/dev/null 2>&1; then
+    apt-get install -y certbot python3-certbot-nginx >>"${LOG_FILE}" 2>&1 || {
+      ui_error "Failed to install certbot / python3-certbot-nginx — see ${LOG_FILE}"
+      return 1
+    }
+  else
+    apt-get install -y certbot python3-certbot-nginx >>"${LOG_FILE}" 2>&1 || true
+  fi
+
+  set +e
+  local plugins
+  plugins="$(certbot plugins 2>/dev/null)"
+  local plug_rc=$?
+  set -e
+  log_file "certbot plugins (rc=${plug_rc}): ${plugins}"
+
+  if ! printf '%s' "${plugins}" | grep -Eiq '(^|[[:space:]])nginx([[:space:]]|$)|\* nginx'; then
+    ui_warn "Certbot nginx plugin not loaded — force-reinstalling python3-certbot-nginx..."
+    apt-get install -y --reinstall python3-certbot-nginx certbot >>"${LOG_FILE}" 2>&1 || {
+      ui_error "Force-reinstall of python3-certbot-nginx failed — see ${LOG_FILE}"
+      return 1
+    }
+    set +e
+    plugins="$(certbot plugins 2>/dev/null)"
+    set -e
+    log_file "certbot plugins after reinstall: ${plugins}"
+    if ! printf '%s' "${plugins}" | grep -Eiq '(^|[[:space:]])nginx([[:space:]]|$)|\* nginx'; then
+      ui_error "The requested nginx plugin does not appear to be installed (python3-certbot-nginx inactive)."
+      return 1
+    fi
+  fi
+  ui_ok "Certbot nginx plugin verified"
+}
+
 # Generate 2048-bit self-signed cert for Cloudflare Full / Virtualmin 443 competition.
 # force=1 regenerates even if files exist.
 ensure_selfsigned_cert() {
@@ -1204,6 +1242,14 @@ provision_tenant_https() {
     return 0
   fi
 
+  if ! ensure_certbot_nginx_plugin; then
+    ui_warn "Certbot nginx plugin unavailable — keeping self-signed HTTPS on ${bind_ip}:443"
+    ensure_selfsigned_cert "${domain}" 0 || true
+    write_nginx_site "${domain}" "${host_port}" "selfsigned" || return 1
+    SSL_STATUS="selfsigned"
+    return 0
+  fi
+
   ui_wait "Requesting Let's Encrypt certificate for ${domain}..."
   set +e
   certbot --nginx -d "${domain}" --non-interactive --agree-tos \
@@ -1235,45 +1281,60 @@ provision_tenant_https() {
   return 0
 }
 
-# Return 0 when https://domain looks like a reachable Soviez/Odoo edge (not a dead panel).
+# Return 0 only when https://domain returns an Odoo/Soviez footprint (not Virtualmin 200 OK).
 verify_tenant_https_http_code() {
   local domain="$1"
-  local body_file code
+  local body_file hdr_file code probe
   body_file="$(mktemp)"
+  hdr_file="$(mktemp)"
 
   set +e
-  code="$(curl -k -sS -L --max-time 5 -o "${body_file}" -w "%{http_code}" \
+  code="$(curl -k -sS -L --max-time 8 \
+    -D "${hdr_file}" -o "${body_file}" -w "%{http_code}" \
     -H "Host: ${domain}" \
     "https://${domain}/" 2>>"${LOG_FILE}")"
   local curl_rc=$?
   set -e
 
-  log_file "HTTPS verify ${domain} curl_rc=${curl_rc} http_code=${code:-}"
+  # Combined probe surface: response headers + body
+  probe="$(cat "${hdr_file}" "${body_file}" 2>/dev/null || true)"
+  log_file "HTTPS verify ${domain} curl_rc=${curl_rc} http_code=${code:-} bytes=${#probe}"
 
   if (( curl_rc != 0 )) || [[ -z "${code}" || "${code}" == "000" ]]; then
-    rm -f "${body_file}"
+    rm -f "${body_file}" "${hdr_file}"
     return 1
   fi
 
+  LAST_HTTPS_CODE="${code}"
+
   case "${code}" in
     200|301|302|303|307|308|404)
-      # Reject obvious alien control-panel HTML when status otherwise looks fine.
-      if grep -Eiq 'virtualmin|webmin|cpanel|plesk|cyberpanel|directadmin|ispconfig' "${body_file}" 2>/dev/null \
-          && ! grep -Eiq 'odoo|soviez|web/database|web/login|web/session' "${body_file}" 2>/dev/null; then
-        log_file "HTTPS verify ${domain}: alien panel HTML detected despite HTTP ${code}"
-        rm -f "${body_file}"
-        return 1
-      fi
-      rm -f "${body_file}"
-      LAST_HTTPS_CODE="${code}"
-      return 0
       ;;
     *)
-      rm -f "${body_file}"
-      LAST_HTTPS_CODE="${code}"
+      log_file "HTTPS verify ${domain}: unexpected HTTP ${code}"
+      rm -f "${body_file}" "${hdr_file}"
       return 1
       ;;
   esac
+
+  # Hard fail on alien panel signatures (Virtualmin et al.) even when status is 200.
+  if printf '%s' "${probe}" | grep -Eiq \
+      'virtualmin|webmin|cpanel|plesk|cyberpanel|directadmin|ispconfig|powered by virtualmin'; then
+    log_file "HTTPS verify ${domain}: alien control-panel footprint detected (HTTP ${code})"
+    rm -f "${body_file}" "${hdr_file}"
+    return 1
+  fi
+
+  # Require a positive Odoo/Soviez footprint — HTTP 200 alone is NOT enough.
+  if ! printf '%s' "${probe}" | grep -Eiq \
+      'odoo|soviez|session_id|web\.assets|web/database|web/login|web/session|__odoo|oe_login|csrf_token'; then
+    log_file "HTTPS verify ${domain}: HTTP ${code} but missing Odoo/Soviez footprint (likely panel hijack)"
+    rm -f "${body_file}" "${hdr_file}"
+    return 1
+  fi
+
+  rm -f "${body_file}" "${hdr_file}"
+  return 0
 }
 
 # Detect non-Nginx processes holding :80 / :443 (Apache, etc.).
@@ -1321,6 +1382,7 @@ dump_port_capture_diagnostics() {
   echo -e "${C_RED}${C_BOLD}════════════════════════════════════════════════════════════════${C_RESET}"
   echo -e "  Expected bind: ${C_BOLD}${bind_ip}:80${C_RESET} / ${C_BOLD}${bind_ip}:443${C_RESET}"
   echo -e "  Last HTTP code: ${C_BOLD}${LAST_HTTPS_CODE:-(none)}${C_RESET}"
+  echo -e "  ${C_DIM}Note: Virtualmin often returns HTTP 200 — Soviez requires an Odoo footprint (odoo/session_id/…).${C_RESET}"
   echo ""
   echo -e "  ${C_BOLD}Listeners on :80 / :443:${C_RESET}"
   if command -v ss >/dev/null 2>&1; then
@@ -1373,13 +1435,13 @@ verify_and_heal_tenant_https() {
 
   require_cmd curl
 
-  ui_wait "Verifying HTTPS route https://${domain} (max 5s)..."
+  ui_wait "Verifying HTTPS route https://${domain} (Odoo footprint, max 8s)..."
   if verify_tenant_https_http_code "${domain}"; then
-    ui_ok "HTTPS verification passed (HTTP ${LAST_HTTPS_CODE})"
+    ui_ok "HTTPS verification passed — Odoo/Soviez footprint live (HTTP ${LAST_HTTPS_CODE})"
     return 0
   fi
 
-  ui_warn "HTTPS verification failed (HTTP ${LAST_HTTPS_CODE:-(curl error)}) — running self-healing diagnostics..."
+  ui_warn "HTTPS verification failed (HTTP ${LAST_HTTPS_CODE:-(curl error)} / missing Odoo footprint) — running self-healing diagnostics..."
   log_file "WARN post-provision HTTPS verify failed for ${domain}; starting heal suite"
 
   # 1) Alien webservers occupying 80/443
@@ -1413,14 +1475,14 @@ verify_and_heal_tenant_https() {
   sleep 2
   ui_ok "Nginx restarted with force-hijack binds on ${bind_ip}"
 
-  ui_wait "Re-verifying HTTPS route https://${domain}..."
+  ui_wait "Re-verifying HTTPS route https://${domain} (Odoo footprint)..."
   if verify_tenant_https_http_code "${domain}"; then
-    ui_ok "HTTPS verification passed after heal (HTTP ${LAST_HTTPS_CODE})"
+    ui_ok "HTTPS verification passed after heal — Odoo/Soviez footprint live (HTTP ${LAST_HTTPS_CODE})"
     return 0
   fi
 
   dump_port_capture_diagnostics "${domain}" "${bind_ip}"
-  ui_error "Automated hijack attempts exhausted — traffic for ${domain} is still not reaching Soviez."
+  ui_error "Automated hijack attempts exhausted — traffic for ${domain} is still not reaching Soviez (no Odoo footprint)."
   exit 1
 }
 
@@ -1552,7 +1614,6 @@ BANNER
   echo -e "     ${C_DIM}Drop Odoo modules here, then refresh Apps or run ./soviez.sh --update${C_RESET}"
   print_ssl_status_report "${domain}" "${SSL_STATUS:-}"
   if [[ "${SSL_STATUS:-}" == "selfsigned" ]]; then
-    echo -e "  ${C_YELLOW}⚠️  SSL Note: Using Cloudflare? Ensure your Cloudflare SSL/TLS encryption mode is set to 'Full' so your site opens securely immediately!${C_RESET}"
     echo -e "  ${C_DIM}Re-attempt Let's Encrypt later: sudo ./soviez.sh --formssl ${domain}${C_RESET}"
     echo ""
   fi
@@ -1595,8 +1656,9 @@ mode_init() {
   systemctl enable --now nginx >>"${LOG_FILE}" 2>&1 || true
   show_progress "Applying Nginx ERP traffic limits..." configure_nginx_global_limits
 
-  show_progress "Installing Certbot (nginx plugin)..." \
-    apt-get install -y certbot python3-certbot-nginx || exit 1
+  show_progress "Installing Certbot + python3-certbot-nginx..." bash -c \
+    'apt-get install -y certbot python3-certbot-nginx' || exit 1
+  ensure_certbot_nginx_plugin || exit 1
 
   ensure_ufw
 
@@ -1886,8 +1948,6 @@ mode_formssl() {
   if [[ "${SSL_STATUS}" == "letsencrypt" ]]; then
     echo -e "  ${C_GREEN}True Let's Encrypt SSL is active.${C_RESET} Browsers will trust https://${domain}"
   else
-    echo -e "  ${C_YELLOW}Self-Signed setup optimized for Cloudflare Full mode.${C_RESET}"
-    echo -e "  ${C_YELLOW}⚠️  SSL Note: Using Cloudflare? Ensure your Cloudflare SSL/TLS encryption mode is set to 'Full' so your site opens securely immediately!${C_RESET}"
     echo -e "  ${C_DIM}Tip: Switch Cloudflare to DNS-only (grey cloud) temporarily, then re-run:${C_RESET}"
     echo -e "    ${C_BOLD}sudo ./soviez.sh --formssl ${domain}${C_RESET}"
   fi
