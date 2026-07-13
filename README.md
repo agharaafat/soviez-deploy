@@ -2,7 +2,7 @@
 
 **A hardened, high-performance, corporate-sovereign Enterprise Resource Planning platform.**
 
-Soviez ERP is a specialized, production-ready **fork of Odoo 18**, engineered for total data privacy, infrastructure independence, and zero vendor lock-in. Deploy it on your metal, in your VPC, or on any Docker-capable host — you retain full control of the runtime, the database, and the data plane.
+Soviez ERP is a specialized, production-ready **sovereign enterprise resource planning platform**, engineered for total data privacy, infrastructure independence, and zero vendor lock-in. Deploy it on your metal, in your VPC, or on any Docker-capable host — you retain full control of the runtime, the database, and the data plane.
 
 [![Version](https://img.shields.io/badge/version-18.0.1.01.0-0D9488.svg)](https://hub.docker.com/r/soviez/soviez-erp)
 [![Docker](https://img.shields.io/badge/docker-soviez%2Fsoviez--erp-2496ED.svg)](https://hub.docker.com/r/soviez/soviez-erp)
@@ -57,7 +57,7 @@ Because Soviez ERP operates on a strict, hardened secure cookie architecture (`s
 
 ### 🔑 3. Commercial Licensing
 
-Soviez ERP is a locked commercial platform. Running this stack requires a valid, node-bound license signature.
+Soviez ERP is a locked commercial platform. Running this stack requires a valid, instance-bound (MAC::UUID) license signature.
 
 - To procure or renew a valid instance key, visit the official pricing console at: [soviez.com/pricing](https://soviez.com/pricing).
 - Unlicensed instances will fail-closed and restrict backend workflow operations until a cryptographically verified signature is bound via the software activation assistant.
@@ -107,7 +107,7 @@ Track rolling Hub releases and migrate schemas in one command:
 ./setup.sh --update
 ```
 
-Pulls `soviez/soviez-erp:latest` + `postgres:latest`, runs `-u base,local_license_guard,mail,web,web_enterprise,soviez_web_ui --stop-after-init` against discovered databases, recycles `soviez-web`, and prints a green success banner. Volumes and MAC/port secrets stay intact.
+Pulls `soviez/soviez-erp:latest` + `postgres:latest`, runs `-u base,local_license_guard,mail,web,web_enterprise,soviez_web_ui --stop-after-init` against discovered databases, recycles `soviez-web`, and prints a green success banner. Volumes, MAC/port secrets, and existing license bindings stay intact — `--update` upgrades the runtime and schema without requiring re-activation.
 
 ### 🏢 Provisioning Multi-Tenant Isolated Instances
 
