@@ -491,7 +491,7 @@ run_schema_upgrades() {
     set -e
     if (( upgrade_rc != 0 )); then
       log_error "Schema upgrade failed for '${dbname}' (exit ${upgrade_rc})."
-      log_error "Leaving live web runner untouched to avoid a corrupted cut-over."
+      log_error "Web runner stays offline until ./setup.sh --update succeeds."
       return "${upgrade_rc}"
     fi
     log_info "Schema upgrade finished for '${dbname}'."
@@ -581,15 +581,20 @@ if [[ "${MODE}" == "update" ]]; then
   fi
   wait_for_postgres
 
-  log_info "Starting maintenance upgrade containers (live web runner stays up until success)..."
+  # Pre-upgrade isolation: stop live workers so maintenance -u does not contend
+  # on global tables (res.partner / res.users / portal) with active HTTP sockets.
+  log_info "Opening maintenance window — stopping live web runner '${WEB_CONTAINER}' to release DB locks..."
+  docker stop "${WEB_CONTAINER}" 2>/dev/null || true
+  docker rm -f "${WEB_CONTAINER}" 2>/dev/null || true
+
+  log_info "Starting maintenance schema upgrade (exclusive DB access; modules: ${UPGRADE_MODULES})..."
   if ! run_schema_upgrades; then
-    log_error "Automated schema upgrade aborted — live '${WEB_CONTAINER}' was NOT recycled."
+    log_error "Automated schema upgrade aborted — '${WEB_CONTAINER}' remains offline."
+    log_error "Fix the upgrade failure, then re-run: ./setup.sh --update"
     exit 1
   fi
 
-  log_info "Maintenance upgrades clean — tearing down old web runner '${WEB_CONTAINER}'..."
-  docker rm -f "${WEB_CONTAINER}" 2>/dev/null || true
-
+  log_info "Maintenance upgrades clean — relaunching live web runner '${WEB_CONTAINER}'..."
   launch_web_container
 
   print_green_success "Core schema upgrade finished — cluster recycled on ${APP_IMAGE}"
