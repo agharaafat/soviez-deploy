@@ -11,7 +11,7 @@ set -euo pipefail
 
 readonly APP_IMAGE="soviez/soviez-erp:latest"
 readonly DB_IMAGE="postgres:latest"
-readonly UPGRADE_MODULES="base,local_license_guard,mail,web,web_enterprise,soviez_web_ui,web_studio"
+readonly UPGRADE_MODULES="base,local_license_guard,mail,web,web_enterprise,soviez_web_ui"
 readonly PORT_SCAN_MAX=8999
 readonly PRIMARY_PORT_START=8069
 readonly MULTI_PORT_START=8073

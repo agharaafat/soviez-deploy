@@ -107,7 +107,7 @@ Track rolling Hub releases and migrate schemas in one command:
 ./setup.sh --update
 ```
 
-Pulls `soviez/soviez-erp:latest` + `postgres:latest`, bind-mounts `~/.soviez` (mode 700) into maintenance + live runners, upgrades every discovered database with `-u base,local_license_guard,mail,web,web_enterprise,soviez_web_ui,web_studio --stop-after-init`, purges compiled `/web/assets/*` attachments, then recycles `soviez-web` **only after** clean exit code 0. Volumes, MAC/port secrets, `~/.soviez` ledger tokens, and existing license bindings stay intact — `--update` upgrades the runtime and schema without requiring re-activation.
+Pulls `soviez/soviez-erp:latest` + `postgres:latest`, bind-mounts `~/.soviez` (mode 700) into maintenance + live runners, upgrades every discovered database with `-u base,local_license_guard,mail,web,web_enterprise,soviez_web_ui --stop-after-init`, purges compiled `/web/assets/*` attachments, then recycles `soviez-web` **only after** clean exit code 0. Volumes, MAC/port secrets, `~/.soviez` ledger tokens, and existing license bindings stay intact — `--update` upgrades the runtime and schema without requiring re-activation.
 
 ### 🏢 Provisioning Multi-Tenant Isolated Instances
 
