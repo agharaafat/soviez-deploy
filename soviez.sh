@@ -36,6 +36,9 @@ TENANT_DOMAIN=""
 FORMSSL_DOMAIN=""
 # Set by provision_tenant_https / --formssl: letsencrypt | selfsigned
 SSL_STATUS=""
+# Public IPv4 used for force-hijack Nginx listen ${PUBLIC_IP}:80/443
+PUBLIC_IP=""
+LAST_HTTPS_CODE=""
 
 # ---------------------------------------------------------------------------
 # Colors / UI
@@ -91,8 +94,8 @@ Images:
   postgres:16
 
 SSL strategy:
-  Baseline port 443 with self-signed cert (Cloudflare Full-safe), then Certbot.
-  If Let's Encrypt fails, self-signed 443 stays online — never HTTP-only.
+  Explicit public-IP listen (beats Virtualmin IP:443), self-signed baseline,
+  then Certbot. Post-provision curl verify + self-heal if routing is stolen.
 
 Verbose log:
   /var/log/soviez_setup.log
@@ -470,8 +473,16 @@ tenant_proxy_incomplete() {
   [[ -z "${domain}" ]] && return 0
   [[ ! -f "${site_file}" ]] && return 0
   [[ ! -e "${enabled_link}" ]] && return 0
-  if ! grep -Eq 'listen[[:space:]]+[^;]*443' "${site_file}" 2>/dev/null; then
-    return 0
+  # Incomplete if vhost lacks an explicit public-IP :443 bind (legacy catch-all loses to Virtualmin).
+  if ! grep -Eq "listen[[:space:]]+${PUBLIC_IP:-[0-9.]+}:443|listen[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:443" "${site_file}" 2>/dev/null; then
+    if ! grep -Eq 'listen[[:space:]]+[^;]*443' "${site_file}" 2>/dev/null; then
+      return 0
+    fi
+    # Generic listen 443 without address is treated as incomplete (Virtualmin hijack risk).
+    if grep -Eq 'listen[[:space:]]+443([[:space:]]|;|$)' "${site_file}" 2>/dev/null \
+        && ! grep -Eq 'listen[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:443' "${site_file}" 2>/dev/null; then
+      return 0
+    fi
   fi
   # Incomplete only if neither LE nor self-signed material exists.
   if [[ ! -f "${le_cert}" && ! -f "${ss_cert}" ]]; then
@@ -815,11 +826,26 @@ print(urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode()
 PY
 )"
   fi
-  if [[ -z "${ip}" ]]; then
-    ui_error "Could not detect public IP (api.ipify.org unreachable)."
+  if [[ -z "${ip}" ]] || ! [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    ui_error "Could not detect public IPv4 (api.ipify.org unreachable)."
     exit 1
   fi
   printf '%s\n' "${ip}"
+}
+
+# Resolve PUBLIC_IP for Nginx force-hijack binds (env → cache → detect).
+ensure_public_bind_ip() {
+  if [[ -n "${PUBLIC_IP:-}" && "${PUBLIC_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s\n' "${PUBLIC_IP}"
+    return 0
+  fi
+  if [[ -n "${SOVIEZ_PUBLIC_IP:-}" && "${SOVIEZ_PUBLIC_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    PUBLIC_IP="${SOVIEZ_PUBLIC_IP}"
+    printf '%s\n' "${PUBLIC_IP}"
+    return 0
+  fi
+  PUBLIC_IP="$(detect_public_ip)"
+  printf '%s\n' "${PUBLIC_IP}"
 }
 
 resolve_domain_ips() {
@@ -1052,14 +1078,16 @@ nginx_site_has_443() {
 
 # Write complete dual-stack vhost: :80 ACME + HTTPS redirect, :443 SSL proxy to ERP.
 # ssl_kind: selfsigned | letsencrypt
+# Force-hijack: bind listen ${PUBLIC_IP}:80/443 so Virtualmin IP:443 cannot steal traffic.
 write_nginx_site() {
   local domain="$1"
   local host_port="$2"
   local ssl_kind="${3:-selfsigned}"
-  local site_file enabled_link crt_file key_file
+  local site_file enabled_link crt_file key_file bind_ip
 
   site_file="$(nginx_site_path "${domain}")"
   enabled_link="/etc/nginx/sites-enabled/soviez-${domain}.conf"
+  bind_ip="$(ensure_public_bind_ip)"
 
   ensure_nginx_global_limits
 
@@ -1081,11 +1109,10 @@ write_nginx_site() {
   cat > "${site_file}" <<EOF
 # Soviez ERP tenant — ${domain} → 127.0.0.1:${host_port}
 # SSL mode: ${ssl_kind}
-# Always binds :443 so Virtualmin / other default HTTPS listeners cannot swallow tenant traffic.
+# Force-hijack bind: ${bind_ip}:80 / ${bind_ip}:443 (matches Virtualmin explicit-IP priority)
 
 server {
-    listen 80;
-    listen [::]:80;
+    listen ${bind_ip}:80;
     server_name ${domain};
 
     client_max_body_size 512M;
@@ -1103,8 +1130,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen ${bind_ip}:443 ssl;
     server_name ${domain};
 
     ssl_certificate     ${crt_file};
@@ -1142,7 +1168,9 @@ server {
 EOF
 
   ln -sfn "${site_file}" "${enabled_link}"
+  # Clear safe Nginx catch-alls that can compete without an explicit server_name match path.
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+  rm -f /etc/nginx/sites-enabled/000-default 2>/dev/null || true
   mkdir -p /var/www/html
 
   if ! nginx -t >>"${LOG_FILE}" 2>&1; then
@@ -1150,23 +1178,25 @@ EOF
     return 1
   fi
   systemctl reload nginx >>"${LOG_FILE}" 2>&1 || systemctl start nginx >>"${LOG_FILE}" 2>&1 || true
-  log_file "Wrote Nginx site ${site_file} ssl_kind=${ssl_kind} crt=${crt_file}"
+  log_file "Wrote Nginx site ${site_file} ssl_kind=${ssl_kind} bind=${bind_ip} crt=${crt_file}"
 }
 
-# Baseline 443 (self-signed) → Certbot → LE rewrite or keep self-signed gracefully.
-# Sets SSL_STATUS to letsencrypt | selfsigned. Always leaves :443 online.
+# Baseline explicit-IP :443 (self-signed) → Certbot → LE rewrite or keep self-signed.
+# Sets SSL_STATUS to letsencrypt | selfsigned. Always leaves PUBLIC_IP:443 online.
 provision_tenant_https() {
   local domain="$1"
   local host_port="$2"
   local certbot_rc=0
+  local bind_ip
 
+  bind_ip="$(ensure_public_bind_ip)"
   SSL_STATUS="selfsigned"
 
-  ui_wait "Writing baseline HTTPS Nginx site (self-signed :443) for ${domain}..."
+  ui_wait "Writing baseline HTTPS Nginx site (${bind_ip}:443 self-signed) for ${domain}..."
   if ! write_nginx_site "${domain}" "${host_port}" "selfsigned"; then
     return 1
   fi
-  ui_ok "Baseline HTTPS site live on :443 (self-signed)"
+  ui_ok "Baseline HTTPS site live on ${bind_ip}:443 (self-signed / force-hijack)"
 
   if ! command -v certbot >/dev/null 2>&1; then
     ui_warn "Certbot not installed — keeping self-signed HTTPS. Run: sudo ./soviez.sh --init"
@@ -1183,13 +1213,13 @@ provision_tenant_https() {
 
   if (( certbot_rc == 0 )) && [[ -f "$(ssl_le_fullchain_path "${domain}")" ]]; then
     ui_ok "Let's Encrypt issued for ${domain}"
-    ui_wait "Locking Nginx to official Let's Encrypt certificate paths..."
+    ui_wait "Locking Nginx to Let's Encrypt paths with explicit ${bind_ip} binds..."
     if write_nginx_site "${domain}" "${host_port}" "letsencrypt"; then
       SSL_STATUS="letsencrypt"
-      ui_ok "HTTPS secured with Let's Encrypt"
+      ui_ok "HTTPS secured with Let's Encrypt on ${bind_ip}:443"
       return 0
     fi
-    ui_warn "LE files exist but Nginx rewrite failed — restoring self-signed :443"
+    ui_warn "LE files exist but Nginx rewrite failed — restoring self-signed ${bind_ip}:443"
   else
     ui_warn "Let's Encrypt failed. Generating high-security Self-Signed fallback certificate..."
     log_file "WARN Certbot failed (rc=${certbot_rc}) for ${domain} — applying self-signed fallback"
@@ -1200,9 +1230,198 @@ provision_tenant_https() {
     return 1
   fi
   SSL_STATUS="selfsigned"
-  ui_ok "Self-signed HTTPS fallback active on :443 (Cloudflare Full-compatible)"
+  ui_ok "Self-signed HTTPS fallback active on ${bind_ip}:443 (Cloudflare Full-compatible)"
   ui_warn "Using Cloudflare? Set SSL/TLS encryption mode to Full so the site opens securely."
   return 0
+}
+
+# Return 0 when https://domain looks like a reachable Soviez/Odoo edge (not a dead panel).
+verify_tenant_https_http_code() {
+  local domain="$1"
+  local body_file code
+  body_file="$(mktemp)"
+
+  set +e
+  code="$(curl -k -sS -L --max-time 5 -o "${body_file}" -w "%{http_code}" \
+    -H "Host: ${domain}" \
+    "https://${domain}/" 2>>"${LOG_FILE}")"
+  local curl_rc=$?
+  set -e
+
+  log_file "HTTPS verify ${domain} curl_rc=${curl_rc} http_code=${code:-}"
+
+  if (( curl_rc != 0 )) || [[ -z "${code}" || "${code}" == "000" ]]; then
+    rm -f "${body_file}"
+    return 1
+  fi
+
+  case "${code}" in
+    200|301|302|303|307|308|404)
+      # Reject obvious alien control-panel HTML when status otherwise looks fine.
+      if grep -Eiq 'virtualmin|webmin|cpanel|plesk|cyberpanel|directadmin|ispconfig' "${body_file}" 2>/dev/null \
+          && ! grep -Eiq 'odoo|soviez|web/database|web/login|web/session' "${body_file}" 2>/dev/null; then
+        log_file "HTTPS verify ${domain}: alien panel HTML detected despite HTTP ${code}"
+        rm -f "${body_file}"
+        return 1
+      fi
+      rm -f "${body_file}"
+      LAST_HTTPS_CODE="${code}"
+      return 0
+      ;;
+    *)
+      rm -f "${body_file}"
+      LAST_HTTPS_CODE="${code}"
+      return 1
+      ;;
+  esac
+}
+
+# Detect non-Nginx processes holding :80 / :443 (Apache, etc.).
+find_alien_http_process() {
+  local ss_out=""
+  if command -v ss >/dev/null 2>&1; then
+    ss_out="$(ss -tulpn 2>/dev/null || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    ss_out="$(netstat -tulpn 2>/dev/null || true)"
+  fi
+  [[ -n "${ss_out}" ]] || return 1
+
+  local line proc
+  while IFS= read -r line; do
+    [[ "${line}" =~ :(80|443)([[:space:]]|$) ]] || continue
+    if printf '%s' "${line}" | grep -Eiq 'nginx'; then
+      continue
+    fi
+    for proc in apache2 httpd apache lighttpd caddy traefik haproxy openresty litespeed; do
+      if printf '%s' "${line}" | grep -Eiq "${proc}"; then
+        printf '%s\n' "${proc}"
+        return 0
+      fi
+    done
+    if printf '%s' "${line}" | grep -Eq 'users:\(\("'; then
+      proc="$(printf '%s' "${line}" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1)"
+      if [[ -n "${proc}" && "${proc}" != "nginx" ]]; then
+        printf '%s\n' "${proc}"
+        return 0
+      fi
+    fi
+  done <<< "${ss_out}"
+  return 1
+}
+
+dump_port_capture_diagnostics() {
+  local domain="$1"
+  local bind_ip="$2"
+  local site_file
+  site_file="$(nginx_site_path "${domain}")"
+
+  echo ""
+  echo -e "${C_RED}${C_BOLD}════════════════════════════════════════════════════════════════${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}  HTTPS routing still captured / unreachable for ${domain}${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}════════════════════════════════════════════════════════════════${C_RESET}"
+  echo -e "  Expected bind: ${C_BOLD}${bind_ip}:80${C_RESET} / ${C_BOLD}${bind_ip}:443${C_RESET}"
+  echo -e "  Last HTTP code: ${C_BOLD}${LAST_HTTPS_CODE:-(none)}${C_RESET}"
+  echo ""
+  echo -e "  ${C_BOLD}Listeners on :80 / :443:${C_RESET}"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tulpn 2>/dev/null | grep -E ':(80|443)\b' || echo "    (none reported)"
+  else
+    netstat -tulpn 2>/dev/null | grep -E ':(80|443)\b' || echo "    (none reported)"
+  fi
+  echo ""
+  echo -e "  ${C_BOLD}Soviez vhost listen lines:${C_RESET}"
+  if [[ -f "${site_file}" ]]; then
+    grep -E '^\s*listen' "${site_file}" | sed 's/^/    /' || true
+  else
+    echo "    (missing ${site_file})"
+  fi
+  echo ""
+  echo -e "  ${C_BOLD}Other Nginx sites mentioning :443:${C_RESET}"
+  grep -RsnE 'listen[[:space:]]+[^;]*443' /etc/nginx/sites-enabled/ 2>/dev/null | sed 's/^/    /' | head -n 40 || true
+  echo ""
+  echo -e "  Full log: ${C_DIM}${LOG_FILE}${C_RESET}"
+  echo -e "  Emergency doctor: ${C_BOLD}sudo ./soviez.sh --formsetup${C_RESET} or ${C_BOLD}sudo ./soviez.sh --formssl ${domain}${C_RESET}"
+  echo ""
+}
+
+# Soft clear of non-Soviez catch-all enabled sites that lack a specific server_name competition risk.
+# Only removes classic default / debian placeholders — never Virtualmin managed sites.
+clear_safe_nginx_catchalls() {
+  local f
+  for f in \
+      /etc/nginx/sites-enabled/default \
+      /etc/nginx/sites-enabled/000-default \
+      /etc/nginx/sites-enabled/default.conf; do
+    if [[ -e "${f}" ]]; then
+      rm -f "${f}"
+      log_file "Removed safe Nginx catch-all: ${f}"
+    fi
+  done
+}
+
+# Post-provision verification + self-heal. Called BEFORE welcome banner.
+# Returns 0 on success; aborts process on alien webserver or unrecoverable capture.
+verify_and_heal_tenant_https() {
+  local domain="$1"
+  local host_port="$2"
+  local bind_ip alien site_file enabled_link
+  LAST_HTTPS_CODE=""
+
+  bind_ip="$(ensure_public_bind_ip)"
+  site_file="$(nginx_site_path "${domain}")"
+  enabled_link="/etc/nginx/sites-enabled/soviez-${domain}.conf"
+
+  require_cmd curl
+
+  ui_wait "Verifying HTTPS route https://${domain} (max 5s)..."
+  if verify_tenant_https_http_code "${domain}"; then
+    ui_ok "HTTPS verification passed (HTTP ${LAST_HTTPS_CODE})"
+    return 0
+  fi
+
+  ui_warn "HTTPS verification failed (HTTP ${LAST_HTTPS_CODE:-(curl error)}) — running self-healing diagnostics..."
+  log_file "WARN post-provision HTTPS verify failed for ${domain}; starting heal suite"
+
+  # 1) Alien webservers occupying 80/443
+  alien=""
+  set +e
+  alien="$(find_alien_http_process)"
+  set -e
+  if [[ -n "${alien}" ]]; then
+    ui_error "⚠️ Error: This server is NOT fresh. Another web server (${alien}) is blocking Soviez. Please deploy on a fresh, clean OS."
+    dump_port_capture_diagnostics "${domain}" "${bind_ip}"
+    exit 1
+  fi
+  ui_ok "No alien webserver detected on :80/:443 (Nginx owns the sockets)"
+
+  # 2) Panel override / catch-all drift — force re-apply explicit IP template
+  ui_wait "Force-applying explicit ${bind_ip}:80/${bind_ip}:443 bind + hard Nginx restart..."
+  clear_safe_nginx_catchalls
+  if [[ ! -e "${enabled_link}" ]]; then
+    ui_warn "Enabled symlink missing — recreating ${enabled_link}"
+  fi
+  if ! write_nginx_site "${domain}" "${host_port}" "${SSL_STATUS:-selfsigned}"; then
+    ui_error "Failed to rewrite Nginx vhost during heal — see ${LOG_FILE}"
+    dump_port_capture_diagnostics "${domain}" "${bind_ip}"
+    exit 1
+  fi
+  systemctl restart nginx >>"${LOG_FILE}" 2>&1 || {
+    ui_error "systemctl restart nginx failed — see ${LOG_FILE}"
+    dump_port_capture_diagnostics "${domain}" "${bind_ip}"
+    exit 1
+  }
+  sleep 2
+  ui_ok "Nginx restarted with force-hijack binds on ${bind_ip}"
+
+  ui_wait "Re-verifying HTTPS route https://${domain}..."
+  if verify_tenant_https_http_code "${domain}"; then
+    ui_ok "HTTPS verification passed after heal (HTTP ${LAST_HTTPS_CODE})"
+    return 0
+  fi
+
+  dump_port_capture_diagnostics "${domain}" "${bind_ip}"
+  ui_error "Automated hijack attempts exhausted — traffic for ${domain} is still not reaching Soviez."
+  exit 1
 }
 
 print_ssl_status_report() {
@@ -1405,6 +1624,7 @@ mode_new() {
 
   local public_ip next_index
   public_ip="$(detect_public_ip)"
+  PUBLIC_IP="${public_ip}"
 
   print_border_box "Welcome to Soviez ERP Tenant Provisioning" \
     "To proceed, you need a domain or subdomain pointed to this server's" \
@@ -1466,6 +1686,8 @@ EOF
     exit 1
   fi
   persist_env_key "SOVIEZ_SSL_MODE" "${SSL_STATUS}"
+  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
+  verify_and_heal_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"
 
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
@@ -1522,6 +1744,10 @@ mode_formsetup() {
     exit 1
   fi
 
+  PUBLIC_IP="${SOVIEZ_PUBLIC_IP:-}"
+  ensure_public_bind_ip >/dev/null
+  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
+
   print_border_box "Soviez ERP — Form Setup Recovery" \
     "Resuming tenant index ${C_BOLD}#${INSTANCE_INDEX}${C_RESET} (${WEB_CONTAINER})" \
     "Domain: ${C_BOLD}${TENANT_DOMAIN}${C_RESET}" \
@@ -1542,7 +1768,9 @@ mode_formsetup() {
     exit 1
   fi
   persist_env_key "SOVIEZ_SSL_MODE" "${SSL_STATUS}"
+  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
   ui_ok "HTTPS pipeline complete for ${TENANT_DOMAIN} (${SSL_STATUS})"
+  verify_and_heal_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"
 
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
@@ -1600,6 +1828,10 @@ mode_formssl() {
     exit 1
   fi
 
+  PUBLIC_IP="${SOVIEZ_PUBLIC_IP:-}"
+  ensure_public_bind_ip >/dev/null
+  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
+
   site_file="$(nginx_site_path "${domain}")"
 
   print_border_box "Soviez ERP — SSL Form Repair" \
@@ -1646,6 +1878,8 @@ mode_formssl() {
     exit 1
   fi
   persist_env_key "SOVIEZ_SSL_MODE" "${SSL_STATUS}"
+  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
+  verify_and_heal_tenant_https "${domain}" "${host_port}"
 
   print_green_success "SSL form repair complete for ${domain}"
   print_ssl_status_report "${domain}" "${SSL_STATUS}"
