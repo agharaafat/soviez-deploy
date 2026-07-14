@@ -7,8 +7,14 @@
 #   ./soviez.sh --formsetup            Resume / heal the latest half-configured tenant (idempotent)
 #   ./soviez.sh --formssl [domain]     Diagnose / repair tenant HTTPS (LE or self-signed Cloudflare Full)
 #   ./soviez.sh --list                 List tenants (index, domain, docker status)
+#   ./soviez.sh --backup <tenant> <db> Space-checked DB+filestore archive → /var/soviez/backups
+#   ./soviez.sh --backup-list          Inventory existing backup archives
 #   ./soviez.sh --stage <tenant> <db>  Clone <db> → stage DB + filestore, then neutralize
-#   ./soviez.sh --dropstage <tenant> <db>  Drop staging DB + filestore (e.g. stage)
+#   ./soviez.sh --dropstage <tenant> <db>  Drop neutralized DB + filestore (safe shield)
+#   ./soviez.sh --reset-pass <tenant> <db> <user> <pass>  Odoo-compliant admin password reset
+#   ./soviez.sh --change-domain <tenant>   Repoint tenant DNS/Nginx/HTTPS to a new domain
+#   ./soviez.sh --monitor              Live docker stats for running soviez-* containers
+#   ./soviez.sh --logs <tenant>        Stream docker logs for the tenant web container
 #   ./soviez.sh --update               Pull soviez/soviez-erp:latest and recycle web runners
 #   ./soviez.sh --recoverdbpass        Rotate Database Master Password (primary / indexed via env)
 #
@@ -22,6 +28,8 @@ readonly PORT_SCAN_MAX=8999
 readonly PRIMARY_PORT_START=8069
 readonly MULTI_PORT_START=8073
 readonly CUSTOM_ADDONS_CONTAINER_PATH="/var/lib/odoo/custom_addons"
+readonly BACKUP_ROOT="/var/soviez/backups"
+readonly BACKUP_SAFETY_MARGIN_BYTES=$((5 * 1024 * 1024 * 1024))
 LOG_FILE="/var/log/soviez_setup.log"
 readonly NGINX_LIMITS_CONF="/etc/nginx/conf.d/soviez_limits.conf"
 
@@ -42,11 +50,19 @@ SSL_STATUS=""
 # Public IPv4 used for force-hijack Nginx listen ${PUBLIC_IP}:80/443
 PUBLIC_IP=""
 LAST_HTTPS_CODE=""
-# Staging mode arguments (--stage / --dropstage)
+# Staging / ops mode arguments
 STAGE_TENANT_REF=""
 STAGE_SOURCE_DB=""
 DROPSTAGE_TENANT_REF=""
 DROPSTAGE_DB=""
+BACKUP_TENANT_REF=""
+BACKUP_DB=""
+RESET_TENANT_REF=""
+RESET_DB=""
+RESET_USERNAME=""
+RESET_PASSWORD=""
+CHANGE_DOMAIN_TENANT_REF=""
+LOGS_TENANT_REF=""
 readonly STAGE_DB_NAME="stage"
 readonly DB_APP_USER="soviez"
 
@@ -97,6 +113,24 @@ for arg in "$@"; do
     --dropstage)
       MODE="dropstage"
       ;;
+    --backup-list)
+      MODE="backup-list"
+      ;;
+    --backup)
+      MODE="backup"
+      ;;
+    --reset-pass)
+      MODE="reset-pass"
+      ;;
+    --change-domain)
+      MODE="change-domain"
+      ;;
+    --monitor)
+      MODE="monitor"
+      ;;
+    --logs)
+      MODE="logs"
+      ;;
     --list)
       MODE="list"
       ;;
@@ -111,21 +145,34 @@ Usage:
   ./soviez.sh [--init]                       Bootstrap host (apt, Docker, Nginx, Certbot, UFW)
   ./soviez.sh --new                          Provision a new isolated tenant (domain + SSL + addons)
   ./soviez.sh --list                         List all tenants (domain + Docker status)
+  ./soviez.sh --backup <tenant> <db>         Space-checked DB + filestore backup (5 GB host buffer)
+  ./soviez.sh --backup-list                  List archives under /var/soviez/backups
   ./soviez.sh --formsetup                    Resume / heal latest half-configured tenant
   ./soviez.sh --formssl [domain]             Diagnose / repair HTTPS (Let's Encrypt or self-signed)
   ./soviez.sh --stage <tenant> <source_db>   Clone source_db → stage (+ filestore), neutralize
-  ./soviez.sh --dropstage <tenant> <db>      Drop a staging DB + filestore (e.g. stage)
+  ./soviez.sh --dropstage <tenant> <db>      Drop a neutralized DB + filestore (safe shield)
+  ./soviez.sh --reset-pass <tenant> <db> <user> <password>
+                                             Odoo-compliant password reset (hashed write)
+  ./soviez.sh --change-domain <tenant>       Repoint tenant to a new domain (DNS + Nginx + SSL)
+  ./soviez.sh --monitor                      Live docker stats for running soviez-* containers
+  ./soviez.sh --logs <tenant>                Follow tenant web container logs
   ./soviez.sh --update                       Pull latest ERP image and recycle web containers
   ./soviez.sh --recoverdbpass                Rotate Database Master Password
   ./soviez.sh --help                         Show this help
 
-Tenant refs for --stage / --dropstage:
+Tenant refs:
   soviez-web-1 | soviez_web_1 | 1 | soviez-web (legacy primary)
 
 Examples:
   sudo ./soviez.sh --list
+  sudo ./soviez.sh --backup 2 production
+  sudo ./soviez.sh --backup-list
   sudo ./soviez.sh --stage soviez-web-1 production
   sudo ./soviez.sh --dropstage soviez-web-1 stage
+  sudo ./soviez.sh --reset-pass 1 production admin 'NewSecret!'
+  sudo ./soviez.sh --change-domain 2
+  sudo ./soviez.sh --monitor
+  sudo ./soviez.sh --logs soviez-web-1
 
 Images:
   soviez/soviez-erp:latest
@@ -153,6 +200,23 @@ USAGE
         DROPSTAGE_TENANT_REF="${clean_arg}"
       elif [[ "${MODE}" == "dropstage" && -z "${DROPSTAGE_DB}" ]]; then
         DROPSTAGE_DB="${clean_arg}"
+      elif [[ "${MODE}" == "backup" && -z "${BACKUP_TENANT_REF}" ]]; then
+        BACKUP_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "backup" && -z "${BACKUP_DB}" ]]; then
+        BACKUP_DB="${clean_arg}"
+      elif [[ "${MODE}" == "reset-pass" && -z "${RESET_TENANT_REF}" ]]; then
+        RESET_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "reset-pass" && -z "${RESET_DB}" ]]; then
+        RESET_DB="${clean_arg}"
+      elif [[ "${MODE}" == "reset-pass" && -z "${RESET_USERNAME}" ]]; then
+        # Do not strip hyphens from username/password payloads.
+        RESET_USERNAME="${arg}"
+      elif [[ "${MODE}" == "reset-pass" && -z "${RESET_PASSWORD}" ]]; then
+        RESET_PASSWORD="${arg}"
+      elif [[ "${MODE}" == "change-domain" && -z "${CHANGE_DOMAIN_TENANT_REF}" ]]; then
+        CHANGE_DOMAIN_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "logs" && -z "${LOGS_TENANT_REF}" ]]; then
+        LOGS_TENANT_REF="${clean_arg}"
       else
         echo "[ERROR] Unknown argument: ${arg}" >&2
         echo "[ERROR] Try: ./soviez.sh --help" >&2
@@ -1148,6 +1212,15 @@ cert_is_letsencrypt_file() {
 
 nginx_site_path() {
   printf '%s\n' "/etc/nginx/sites-available/soviez-${1}.conf"
+}
+
+remove_nginx_site_for_domain() {
+  local domain="$1"
+  local site enabled
+  site="$(nginx_site_path "${domain}")"
+  enabled="/etc/nginx/sites-enabled/soviez-${domain}.conf"
+  rm -f "${site}" "${enabled}" 2>/dev/null || true
+  log_file "Removed Nginx site files for ${domain}"
 }
 
 nginx_site_has_443() {
@@ -2260,6 +2333,115 @@ pg_database_exists() {
   [[ "${found}" == "1" ]]
 }
 
+# Returns ir_config_parameter value for database.is_neutralized (empty if missing).
+pg_is_neutralized_value() {
+  local dbname="$1"
+  docker exec "${DB_CONTAINER}" \
+    psql -U "${DB_APP_USER}" -d "${dbname}" -Atc \
+    "SELECT value FROM ir_config_parameter WHERE key = 'database.is_neutralized' LIMIT 1;" \
+    2>/dev/null || true
+}
+
+bytes_to_gb_str() {
+  local bytes="${1:-0}"
+  awk -v b="${bytes}" 'BEGIN { printf "%.2f", (b + 0) / (1024 * 1024 * 1024) }'
+}
+
+tenant_index_label() {
+  if [[ -n "${INSTANCE_INDEX:-}" ]]; then
+    printf '%s\n' "${INSTANCE_INDEX}"
+  elif [[ -n "${SOVIEZ_INSTANCE_INDEX:-}" ]]; then
+    printf '%s\n' "${SOVIEZ_INSTANCE_INDEX}"
+  else
+    printf '%s\n' "0"
+  fi
+}
+
+# Filestore lives on Docker volume at /fs/<db>; web mount is usually data-dir/filestore.
+measure_filestore_bytes() {
+  local dbname="$1"
+  local size="" path
+
+  for path in \
+      "/root/.local/share/Odoo/filestore/${dbname}" \
+      "/var/lib/odoo/filestore/${dbname}"; do
+    size="$(docker exec "${WEB_CONTAINER}" \
+      du -s -b "${path}" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -n "${size}" && "${size}" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "${size}"
+      return 0
+    fi
+  done
+
+  size="$(docker run --rm \
+      -v "${FILESTORE_VOLUME}:/fs:ro" \
+      alpine:3.20 \
+      sh -c "du -s -b /fs/${dbname} 2>/dev/null | cut -f1" 2>/dev/null || true)"
+  if [[ -n "${size}" && "${size}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${size}"
+    return 0
+  fi
+  printf '%s\n' "0"
+}
+
+lookup_domain_for_index() {
+  local idx="$1"
+  local path domain=""
+  local -a candidates=()
+
+  if [[ "${idx}" == "0" || "${idx}" == "primary" ]]; then
+    candidates+=(
+      "${INSTANCE_ROOT:-}/.soviez.env"
+      "$(pwd)/.soviez.env"
+      "/root/.soviez.env"
+    )
+  fi
+  candidates+=(
+    "/root/.soviez_${idx}.env"
+    "${INSTANCE_ROOT:-}/.soviez_${idx}.env"
+    "$(pwd)/.soviez_${idx}.env"
+  )
+
+  for path in "${candidates[@]}"; do
+    [[ -f "${path}" ]] || continue
+    domain="$(grep -E '^SOVIEZ_TENANT_DOMAIN=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    domain="${domain//$'\r'/}"
+    domain="${domain#\"}"
+    domain="${domain%\"}"
+    domain="${domain#\'}"
+    domain="${domain%\'}"
+    if [[ -n "${domain}" ]]; then
+      printf '%s\n' "${domain}"
+      return 0
+    fi
+  done
+  printf '%s\n' "[Malformed / No Domain]"
+}
+
+assert_backup_disk_space() {
+  local db_size="$1"
+  local filestore_size="$2"
+  local estimated free needed_min free_gb need_gb
+
+  estimated=$((db_size + filestore_size))
+  free="$(df -B1 "${BACKUP_ROOT}" | tail -n 1 | awk '{print $4}')"
+  if [[ -z "${free}" || ! "${free}" =~ ^[0-9]+$ ]]; then
+    echo -e "${C_RED}🚨 [ERROR] Backup Blocked! Unable to measure free space on ${BACKUP_ROOT}.${C_RESET}" >&2
+    exit 1
+  fi
+
+  if (( free - estimated < BACKUP_SAFETY_MARGIN_BYTES )); then
+    needed_min=$((estimated + BACKUP_SAFETY_MARGIN_BYTES))
+    need_gb="$(bytes_to_gb_str "${needed_min}")"
+    free_gb="$(bytes_to_gb_str "${free}")"
+    echo -e "${C_RED}🚨 [ERROR] Backup Blocked! Insufficient disk space. To safely run this backup and preserve a 5 GB host buffer, we need at least ${need_gb} GB free. Only ${free_gb} GB is available.${C_RESET}" >&2
+    log_file "ERROR Backup blocked: free=${free} estimated=${estimated} margin=${BACKUP_SAFETY_MARGIN_BYTES}"
+    exit 1
+  fi
+
+  ui_ok "Disk safety check passed (need ≥$(bytes_to_gb_str "$((estimated + BACKUP_SAFETY_MARGIN_BYTES))") GB free incl. 5 GB buffer; have $(bytes_to_gb_str "${free}") GB)"
+}
+
 clone_filestore_dir() {
   local source_db="$1"
   local target_db="$2"
@@ -2483,11 +2665,12 @@ mode_stage() {
 }
 
 # ===========================================================================
-# MODE: dropstage — drop staging DB + filestore
+# MODE: dropstage — drop neutralized staging DB + filestore (safe shield)
 # ===========================================================================
 mode_dropstage() {
   ensure_log_file
   require_cmd docker
+  local neut_val
 
   if [[ -z "${DROPSTAGE_TENANT_REF}" || -z "${DROPSTAGE_DB}" ]]; then
     ui_error "Usage: sudo ./soviez.sh --dropstage <tenant> <db_to_drop>"
@@ -2519,6 +2702,18 @@ mode_dropstage() {
   fi
   wait_for_postgres || exit 1
 
+  # ---- Neutralization Safe Shield (refuse live production) ----
+  if pg_database_exists "${DROPSTAGE_DB}"; then
+    neut_val="$(pg_is_neutralized_value "${DROPSTAGE_DB}")"
+    neut_val="$(printf '%s' "${neut_val}" | tr -d '[:space:]')"
+    if [[ "${neut_val}" != "True" ]]; then
+      echo -e "${C_RED}🚨 [ERROR] Safe Shield: The database '${DROPSTAGE_DB}' is NOT neutralized (Live Production!). Soviez will not drop production databases. Double-check your target database name.${C_RESET}" >&2
+      log_file "ERROR dropstage blocked — database.is_neutralized='${neut_val}' for ${DROPSTAGE_DB}"
+      exit 1
+    fi
+    ui_ok "Safe Shield: database.is_neutralized=True on ${DROPSTAGE_DB}"
+  fi
+
   # ---- Step A: DROP DATABASE ----
   if pg_database_exists "${DROPSTAGE_DB}"; then
     ui_wait "Terminating connections to ${DROPSTAGE_DB}..."
@@ -2542,6 +2737,424 @@ mode_dropstage() {
   print_green_success "Staging cleanup complete: ${DROPSTAGE_DB}"
   echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
   echo ""
+}
+
+# ===========================================================================
+# MODE: backup — pg_dump + filestore archive with strict 5 GB host buffer
+# ===========================================================================
+mode_backup() {
+  ensure_log_file
+
+  if [[ -z "${BACKUP_TENANT_REF}" || -z "${BACKUP_DB}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --backup <tenant_index_or_web> <db_name>"
+    ui_error "Example: sudo ./soviez.sh --backup 2 production"
+    exit 1
+  fi
+
+  require_root --backup
+  require_cmd docker
+  require_cmd tar
+  require_cmd df
+  assert_safe_dbname "${BACKUP_DB}"
+
+  print_border_box "Soviez ERP — Database Backup" \
+    "Tenant: ${C_BOLD}${BACKUP_TENANT_REF}${C_RESET}" \
+    "Database: ${C_BOLD}${BACKUP_DB}${C_RESET}" \
+    "Guard: ${C_BOLD}5 GB host free-space buffer${C_RESET}"
+
+  load_tenant_topology_from_ref "${BACKUP_TENANT_REF}"
+
+  if ! container_running "${DB_CONTAINER}"; then
+    if container_exists "${DB_CONTAINER}"; then
+      ui_wait "Starting database container ${DB_CONTAINER}..."
+      docker start "${DB_CONTAINER}" >/dev/null
+    else
+      ui_error "Database container missing: ${DB_CONTAINER}"
+      exit 1
+    fi
+  fi
+  wait_for_postgres || exit 1
+
+  if ! pg_database_exists "${BACKUP_DB}"; then
+    ui_error "Database '${BACKUP_DB}' does not exist on ${DB_CONTAINER}"
+    exit 1
+  fi
+
+  mkdir -p "${BACKUP_ROOT}"
+  chmod 700 "${BACKUP_ROOT}" 2>/dev/null || true
+
+  local db_size filestore_size idx stamp archive workdir dump_file
+  ui_wait "Measuring database and filestore size for space guard..."
+  db_size="$(docker exec -i "${DB_CONTAINER}" \
+    psql -U "${DB_APP_USER}" -d postgres -t -A -c \
+    "SELECT pg_database_size('${BACKUP_DB}');" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -z "${db_size}" || ! "${db_size}" =~ ^[0-9]+$ ]]; then
+    ui_error "Unable to measure database size for '${BACKUP_DB}'"
+    exit 1
+  fi
+  filestore_size="$(measure_filestore_bytes "${BACKUP_DB}")"
+  ui_info "DB size=$(bytes_to_gb_str "${db_size}") GB  filestore=$(bytes_to_gb_str "${filestore_size}") GB"
+
+  assert_backup_disk_space "${db_size}" "${filestore_size}"
+
+  idx="$(tenant_index_label)"
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  archive="${BACKUP_ROOT}/soviez_backup_tenant${idx}_${BACKUP_DB}_${stamp}.tar.gz"
+  workdir="$(mktemp -d /tmp/soviez_backup.XXXXXX)"
+  dump_file="${workdir}/database.dump"
+  mkdir -p "${workdir}/filestore"
+
+  # Cleanup on failure
+  trap 'rm -rf "${workdir}"' RETURN
+
+  ui_wait "Running pg_dump -Fc for ${BACKUP_DB}..."
+  if ! docker exec -i "${DB_CONTAINER}" \
+      pg_dump -U "${DB_APP_USER}" -d "${BACKUP_DB}" -F c > "${dump_file}" 2>>"${LOG_FILE}"; then
+    ui_error "pg_dump failed — see ${LOG_FILE}"
+    exit 1
+  fi
+  if [[ ! -s "${dump_file}" ]]; then
+    ui_error "pg_dump produced an empty archive"
+    exit 1
+  fi
+  ui_ok "Database dump written ($(bytes_to_gb_str "$(wc -c < "${dump_file}")") GB)"
+
+  ui_wait "Archiving filestore ${BACKUP_DB} from volume ${FILESTORE_VOLUME}..."
+  if ! docker run --rm \
+      -v "${FILESTORE_VOLUME}:/fs:ro" \
+      -v "${workdir}/filestore:/out" \
+      alpine:3.20 \
+      sh -c "set -e
+        if [ -d /fs/${BACKUP_DB} ]; then
+          cp -a /fs/${BACKUP_DB}/. /out/
+        else
+          echo 'WARN: filestore directory missing — empty filestore in archive' >&2
+        fi
+      " >>"${LOG_FILE}" 2>&1; then
+    ui_warn "Filestore copy had issues — continuing with dump-only contents (see ${LOG_FILE})"
+  else
+    ui_ok "Filestore staged for archive"
+  fi
+
+  printf '%s\n' \
+    "tenant_index=${idx}" \
+    "database=${BACKUP_DB}" \
+    "web_container=${WEB_CONTAINER}" \
+    "db_container=${DB_CONTAINER}" \
+    "filestore_volume=${FILESTORE_VOLUME}" \
+    "domain=${SOVIEZ_TENANT_DOMAIN:-}" \
+    "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "${workdir}/MANIFEST.txt"
+
+  ui_wait "Compressing archive → ${archive}..."
+  if ! tar -czf "${archive}" -C "${workdir}" database.dump filestore MANIFEST.txt >>"${LOG_FILE}" 2>&1; then
+    ui_error "tar failed — see ${LOG_FILE}"
+    rm -f "${archive}" 2>/dev/null || true
+    exit 1
+  fi
+  chmod 600 "${archive}" 2>/dev/null || true
+
+  print_green_success "Backup complete"
+  echo -e "  Archive: ${C_BOLD}${archive}${C_RESET}"
+  echo -e "  Size:    ${C_CYAN}$(bytes_to_gb_str "$(wc -c < "${archive}")") GB${C_RESET}"
+  echo -e "  List:    ${C_BOLD}sudo ./soviez.sh --backup-list${C_RESET}"
+  echo ""
+}
+
+# ===========================================================================
+# MODE: backup-list — inventory /var/soviez/backups (stdout table)
+# ===========================================================================
+mode_backup_list() {
+  local path base idx db stamp domain show
+  local -a files=()
+  local found=0
+
+  if [[ ! -d "${BACKUP_ROOT}" ]]; then
+    echo ""
+    echo -e "${C_BOLD}Soviez ERP — Backup Inventory${C_RESET}"
+    echo -e "${C_DIM}No backup directory yet: ${BACKUP_ROOT}${C_RESET}"
+    echo ""
+    return 0
+  fi
+
+  shopt -s nullglob
+  files=("${BACKUP_ROOT}"/soviez_backup_tenant*.tar.gz)
+  shopt -u nullglob
+
+  echo ""
+  echo -e "${C_BOLD}Soviez ERP — Backup Inventory${C_RESET}"
+  echo -e "${C_DIM}${BACKUP_ROOT}${C_RESET}"
+  echo ""
+
+  if (( ${#files[@]} == 0 )); then
+    echo "No backup archives found matching soviez_backup_tenant*.tar.gz"
+    echo ""
+    return 0
+  fi
+
+  printf '+-----------------------------------------------+--------+------------------+----------------------------------+------------------+\n'
+  printf '| %-45s | %-6s | %-16s | %-32s | %-16s |\n' \
+    "File Name" "Tenant" "Target DB" "Domain" "Timestamp"
+  printf '+-----------------------------------------------+--------+------------------+----------------------------------+------------------+\n'
+
+  for path in "${files[@]}"; do
+    [[ -f "${path}" ]] || continue
+    base="$(basename "${path}")"
+    if [[ "${base}" =~ ^soviez_backup_tenant([0-9]+)_(.+)_([0-9]{8}_[0-9]{6})\.tar\.gz$ ]]; then
+      idx="${BASH_REMATCH[1]}"
+      db="${BASH_REMATCH[2]}"
+      stamp="${BASH_REMATCH[3]}"
+    else
+      idx="?"
+      db="?"
+      stamp="?"
+    fi
+    domain="$(lookup_domain_for_index "${idx}")"
+    # Truncate long filenames for column width
+    show="${base}"
+    if (( ${#show} > 45 )); then
+      show="${show:0:42}..."
+    fi
+    printf '| %-45s | %-6s | %-16s | %-32s | %-16s |\n' \
+      "${show}" "${idx}" "${db}" "${domain}" "${stamp}"
+    found=$((found + 1))
+  done
+
+  printf '+-----------------------------------------------+--------+------------------+----------------------------------+------------------+\n'
+  echo -e "${C_DIM}${found} archive(s)${C_RESET}"
+  echo ""
+}
+
+# ===========================================================================
+# MODE: reset-pass — Odoo-compliant res.users password write via shell
+# ===========================================================================
+mode_reset_pass() {
+  ensure_log_file
+
+  if [[ -z "${RESET_TENANT_REF}" || -z "${RESET_DB}" || -z "${RESET_USERNAME}" || -z "${RESET_PASSWORD}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --reset-pass <tenant> <db_name> <username> <new_password>"
+    ui_error "Example: sudo ./soviez.sh --reset-pass 1 production admin 'NewSecret!'"
+    exit 1
+  fi
+
+  require_root --reset-pass
+  require_cmd docker
+  assert_safe_dbname "${RESET_DB}"
+
+  print_border_box "Soviez ERP — Admin Password Reset" \
+    "Tenant: ${C_BOLD}${RESET_TENANT_REF}${C_RESET}" \
+    "Database: ${C_BOLD}${RESET_DB}${C_RESET}" \
+    "User: ${C_BOLD}${RESET_USERNAME}${C_RESET}"
+
+  load_tenant_topology_from_ref "${RESET_TENANT_REF}"
+
+  if ! container_running "${WEB_CONTAINER}"; then
+    if container_exists "${WEB_CONTAINER}"; then
+      ui_wait "Starting web container ${WEB_CONTAINER}..."
+      docker start "${WEB_CONTAINER}" >/dev/null
+      sleep 3
+    else
+      ui_error "Web container missing: ${WEB_CONTAINER}"
+      exit 1
+    fi
+  fi
+
+  if ! container_running "${DB_CONTAINER}"; then
+    if container_exists "${DB_CONTAINER}"; then
+      docker start "${DB_CONTAINER}" >/dev/null
+    else
+      ui_error "Database container missing: ${DB_CONTAINER}"
+      exit 1
+    fi
+  fi
+  wait_for_postgres || exit 1
+
+  if ! pg_database_exists "${RESET_DB}"; then
+    ui_error "Database '${RESET_DB}' does not exist on ${DB_CONTAINER}"
+    exit 1
+  fi
+
+  ui_wait "Updating password via soviez-bin shell (Odoo hashing)..."
+  local py_script rc=0 login_b64 pass_b64
+  login_b64="$(printf '%s' "${RESET_USERNAME}" | base64 | tr -d '\n')"
+  pass_b64="$(printf '%s' "${RESET_PASSWORD}" | base64 | tr -d '\n')"
+  py_script="$(cat <<'PY'
+import base64
+import os
+import sys
+login = base64.b64decode(os.environ.get("SOVIEZ_RESET_LOGIN_B64", "")).decode("utf-8")
+passwd = base64.b64decode(os.environ.get("SOVIEZ_RESET_PASS_B64", "")).decode("utf-8")
+if not login or not passwd:
+    raise SystemExit("Missing login/password payload")
+user = env["res.users"].search([("login", "=", login)], limit=1)
+if not user:
+    raise SystemExit(f"User not found: {login}")
+user.write({"password": passwd})
+env.cr.commit()
+print(f"OK password updated for login={login} uid={user.id}")
+PY
+)"
+
+  set +e
+  # Prefer -u odoo when available; fall back to container default user.
+  printf '%s\n' "${py_script}" | docker exec -i \
+      -e "SOVIEZ_RESET_LOGIN_B64=${login_b64}" \
+      -e "SOVIEZ_RESET_PASS_B64=${pass_b64}" \
+      -u odoo \
+      "${WEB_CONTAINER}" \
+      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+        --db_host="${DB_CONTAINER}" \
+        --db_port=5432 \
+        --db_user="${DB_APP_USER}" \
+        --db_password="${SOVIEZ_DB_PASSWORD}" \
+        --data-dir=/root/.local/share/Odoo \
+        -d "${RESET_DB}" --stop-after-init shell >>"${LOG_FILE}" 2>&1
+  rc=$?
+  if (( rc != 0 )); then
+    printf '%s\n' "${py_script}" | docker exec -i \
+        -e "SOVIEZ_RESET_LOGIN_B64=${login_b64}" \
+        -e "SOVIEZ_RESET_PASS_B64=${pass_b64}" \
+        "${WEB_CONTAINER}" \
+        python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+          --db_host="${DB_CONTAINER}" \
+          --db_port=5432 \
+          --db_user="${DB_APP_USER}" \
+          --db_password="${SOVIEZ_DB_PASSWORD}" \
+          --data-dir=/root/.local/share/Odoo \
+          -d "${RESET_DB}" --stop-after-init shell >>"${LOG_FILE}" 2>&1
+    rc=$?
+  fi
+  set -e
+
+  if (( rc != 0 )); then
+    ui_error "Password reset failed — see ${LOG_FILE}"
+    exit 1
+  fi
+
+  print_green_success "Password updated for ${RESET_USERNAME} on ${RESET_DB}"
+  echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
+  echo ""
+}
+
+# ===========================================================================
+# MODE: change-domain — DNS verify + Nginx/SSL rebind for existing tenant
+# ===========================================================================
+mode_change_domain() {
+  ensure_log_file
+
+  if [[ -z "${CHANGE_DOMAIN_TENANT_REF}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --change-domain <tenant_index_or_web>"
+    ui_error "Example: sudo ./soviez.sh --change-domain 2"
+    exit 1
+  fi
+
+  require_root --change-domain
+  require_cmd docker
+  require_cmd nginx
+
+  print_border_box "Soviez ERP — Change Tenant Domain" \
+    "Tenant: ${C_BOLD}${CHANGE_DOMAIN_TENANT_REF}${C_RESET}"
+
+  load_tenant_topology_from_ref "${CHANGE_DOMAIN_TENANT_REF}"
+
+  local old_domain host_port new_domain public_ip
+  old_domain="${SOVIEZ_TENANT_DOMAIN:-}"
+  host_port="${SOVIEZ_HOST_PORT:-}"
+  if [[ -z "${host_port}" ]]; then
+    ui_error "Env sheet missing SOVIEZ_HOST_PORT — cannot rebind Nginx"
+    exit 1
+  fi
+
+  echo -e "  Current domain: ${C_BOLD}${old_domain:-"(none)"}${C_RESET}"
+  prompt_domain_confirmed
+  new_domain="${TENANT_DOMAIN}"
+
+  if [[ -n "${old_domain}" && "${old_domain}" == "${new_domain}" ]]; then
+    ui_warn "New domain matches the current domain — nothing to change"
+    exit 0
+  fi
+
+  public_ip="$(detect_public_ip)"
+  PUBLIC_IP="${public_ip}"
+  dns_validation_loop "${public_ip}" "${new_domain}"
+
+  if [[ -n "${old_domain}" ]]; then
+    ui_wait "Removing old Nginx site files for ${old_domain}..."
+    remove_nginx_site_for_domain "${old_domain}"
+    ui_ok "Old Nginx bindings removed"
+  fi
+
+  ui_wait "Updating SOVIEZ_TENANT_DOMAIN in ${ENV_FILE}..."
+  persist_env_key "SOVIEZ_TENANT_DOMAIN" "${new_domain}"
+  SOVIEZ_TENANT_DOMAIN="${new_domain}"
+  TENANT_DOMAIN="${new_domain}"
+  ui_ok "Env sheet updated → ${new_domain}"
+
+  if ! provision_tenant_https "${new_domain}" "${host_port}"; then
+    ui_error "HTTPS provision failed for ${new_domain} — see ${LOG_FILE}"
+    exit 1
+  fi
+
+  verify_and_heal_tenant_https "${new_domain}" "${host_port}" || true
+  print_ssl_status_report "${new_domain}"
+
+  print_green_success "Domain changed to ${new_domain}"
+  echo -e "  Previous: ${C_DIM}${old_domain:-"(none)"}${C_RESET}"
+  echo -e "  Env:      ${C_BOLD}${ENV_FILE}${C_RESET}"
+  echo ""
+}
+
+# ===========================================================================
+# MODE: monitor — docker stats for running soviez-* containers
+# ===========================================================================
+mode_monitor() {
+  require_cmd docker
+  local -a names=()
+  local n
+
+  while IFS= read -r n; do
+    [[ -n "${n}" ]] || continue
+    names+=("${n}")
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^soviez-' || true)
+
+  if (( ${#names[@]} == 0 )); then
+    echo ""
+    echo -e "${C_BOLD}Soviez ERP — Live Monitor${C_RESET}"
+    echo "No running containers whose names start with soviez-."
+    echo ""
+    return 0
+  fi
+
+  echo ""
+  echo -e "${C_BOLD}Soviez ERP — Live Monitor${C_RESET}"
+  echo -e "${C_DIM}Tracking ${#names[@]} running container(s)${C_RESET}"
+  echo ""
+  docker stats "${names[@]}"
+}
+
+# ===========================================================================
+# MODE: logs — follow tenant web container logs
+# ===========================================================================
+mode_logs() {
+  if [[ -z "${LOGS_TENANT_REF}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --logs <tenant_index_or_web>"
+    ui_error "Example: sudo ./soviez.sh --logs soviez-web-1"
+    exit 1
+  fi
+
+  require_cmd docker
+
+  load_tenant_topology_from_ref "${LOGS_TENANT_REF}"
+
+  if ! container_exists "${WEB_CONTAINER}"; then
+    ui_error "Web container not found: ${WEB_CONTAINER}"
+    exit 1
+  fi
+
+  echo ""
+  echo -e "${C_BOLD}Soviez ERP — Logs${C_RESET}  ${C_DIM}${WEB_CONTAINER} (tail 100, follow)${C_RESET}"
+  echo ""
+  exec docker logs -f --tail 100 "${WEB_CONTAINER}"
 }
 
 # ===========================================================================
@@ -2675,9 +3288,13 @@ list_tenants() {
 # ===========================================================================
 # Dispatch
 # ===========================================================================
-if [[ "${MODE}" != "list" ]]; then
-  ensure_log_file
-fi
+case "${MODE}" in
+  list|backup-list|monitor|logs)
+    ;;
+  *)
+    ensure_log_file
+    ;;
+esac
 
 case "${MODE}" in
   init)
@@ -2688,6 +3305,12 @@ case "${MODE}" in
     ;;
   list)
     list_tenants
+    ;;
+  backup)
+    mode_backup
+    ;;
+  backup-list)
+    mode_backup_list
     ;;
   formsetup)
     mode_formsetup
@@ -2700,6 +3323,18 @@ case "${MODE}" in
     ;;
   dropstage)
     mode_dropstage
+    ;;
+  reset-pass)
+    mode_reset_pass
+    ;;
+  change-domain)
+    mode_change_domain
+    ;;
+  monitor)
+    mode_monitor
+    ;;
+  logs)
+    mode_logs
     ;;
   update)
     mode_update

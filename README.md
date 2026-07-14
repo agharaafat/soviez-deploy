@@ -93,10 +93,16 @@ sudo ./soviez.sh --formssl
 | **Init** | `./soviez.sh --init` (default) | Apt, Docker, Nginx, Certbot, UFW — host only |
 | **New** | `./soviez.sh --new` | Domain + DNS check + isolated ERP/Postgres stack + HTTPS |
 | **List** | `./soviez.sh --list` | Table of tenants (index, domain, Docker status) |
+| **Backup** | `./soviez.sh --backup <tenant> <db>` | Space-checked DB + filestore archive (5 GB host buffer) |
+| **Backup list** | `./soviez.sh --backup-list` | Inventory of `/var/soviez/backups` archives |
 | **Form setup** | `./soviez.sh --formsetup` | Resume / heal the latest half-configured tenant (idempotent) |
 | **Form SSL** | `./soviez.sh --formssl [domain]` | Diagnose / repair HTTPS (Let's Encrypt or self-signed) |
 | **Stage** | `./soviez.sh --stage <tenant> <source_db>` | Clone a live DB into neutralized `stage` (+ filestore) |
-| **Drop stage** | `./soviez.sh --dropstage <tenant> <db>` | Drop a staging DB + filestore |
+| **Drop stage** | `./soviez.sh --dropstage <tenant> <db>` | Drop a neutralized staging DB + filestore (Safe Shield) |
+| **Reset pass** | `./soviez.sh --reset-pass <tenant> <db> <user> <pass>` | Odoo-hashed ERP login password reset |
+| **Change domain** | `./soviez.sh --change-domain <tenant>` | Repoint tenant domain + Nginx/SSL |
+| **Monitor** | `./soviez.sh --monitor` | Live stats for running `soviez-*` containers |
+| **Logs** | `./soviez.sh --logs <tenant>` | Follow tenant web container logs |
 | **Update** | `./soviez.sh --update` | Pull latest ERP image and upgrade schemas |
 | **Recover** | `./soviez.sh --recoverdbpass` | Rotate Database Master Password |
 
@@ -187,7 +193,39 @@ sudo ./soviez.sh --stage soviez-web-1 production
 sudo ./soviez.sh --dropstage soviez-web-1 stage
 ```
 
-Duplicates a live database into **`stage`** (including filestore), runs neutralization for safe testing, and cleans up with `--dropstage` when you are done.
+Duplicates a live database into **`stage`** (including filestore), runs neutralization for safe testing, and cleans up with `--dropstage` when you are done. `--dropstage` only proceeds when `database.is_neutralized=True` (Safe Shield).
+
+### 💾 Backup & Restore Inventory
+
+```bash
+sudo ./soviez.sh --backup 2 production
+sudo ./soviez.sh --backup-list
+```
+
+Creates a compressed archive under `/var/soviez/backups` after a **strict 5 GB free-space safety check**. `--backup-list` shows tenant, DB, linked domain, and timestamp for every archive.
+
+### 🔑 Reset ERP Login Password
+
+```bash
+sudo ./soviez.sh --reset-pass 1 production admin 'NewSecret!'
+```
+
+Writes the new password through Odoo’s normal hashing path (`soviez-bin shell`).
+
+### 🌐 Change Domain
+
+```bash
+sudo ./soviez.sh --change-domain 2
+```
+
+DNS confirmation → update env sheet → rewrite Nginx + HTTPS for the new FQDN.
+
+### 📡 Monitor & Logs
+
+```bash
+sudo ./soviez.sh --monitor
+sudo ./soviez.sh --logs soviez-web-1
+```
 
 ### Manual `docker run` (lab / equivalent topology)
 
