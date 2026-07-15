@@ -72,7 +72,10 @@ Soviez ERP is a locked commercial platform. Running this stack requires a valid,
 On Ubuntu/Debian, download the public bootstrap wizard and run the **two-step** production flow:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/agharaafat/soviez-deploy/main/soviez.sh -o soviez.sh
+curl -sSL https://soviez.sh | bash
+
+# Explicit download from the canonical deploy repository:
+curl -fsSL https://raw.githubusercontent.com/Soviez/soviez-deploy/main/soviez.sh -o soviez.sh
 chmod +x soviez.sh
 
 # 1) Prepare the host (Docker, Nginx, Certbot, firewall) — no ERP containers yet
