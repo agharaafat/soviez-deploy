@@ -112,7 +112,7 @@ sudo ./soviez.sh --formssl
 The installer:
 
 - Keeps verbose detail in **`/var/log/soviez_setup.log`**; the terminal shows clean status lines only
-- On `--new`: creates an immutable `.soviez_N.env` (MAC, Postgres password, **Database Master Password**, host port from **8073**), starts **`postgres:16`** + **`soviez/soviez-erp:latest`**, mounts custom addons under `/etc/soviez_web_N/addons`, writes Nginx `:80` + `:443` (self-signed baseline → Certbot), and prints the live **`https://your.domain`** URL
+- On `--new`: creates an immutable `.soviez_N.env` (MAC, Postgres password, **Database Master Password**, host port from **8073**), starts **`postgres:16`** + **`soviez/soviez-erp:latest`**, mounts custom addons under `/soviez/soviez_web_N/addons`, writes Nginx `:80` + `:443` (self-signed baseline → Certbot), and prints the live **`https://your.domain`** URL
 - Flashes a high-visibility console alert with the Database Master Password — save it immediately
 - If Let's Encrypt fails, keeps self-signed HTTPS online and reminds you to set Cloudflare SSL/TLS to **Full**
 
@@ -160,7 +160,7 @@ Spin parallel ERP clusters on one host:
 sudo ./soviez.sh --new
 ```
 
-Each run allocates the next index (`.soviez_1.env`, `.soviez_2.env`, …), creates sandboxed network/volume/container names, prepares `/etc/soviez_web_N/addons`, binds a free port from **8073**, validates DNS for your domain, issues TLS, and flashes the new Master Password.
+Each run allocates the next index (`.soviez_1.env`, `.soviez_2.env`, …), creates sandboxed network/volume/container names, prepares `/soviez/soviez_web_N/addons`, binds a free port from **8073**, validates DNS for your domain, issues TLS, and flashes the new Master Password.
 
 ### 🩹 Form Setup — Resume a Failed Provision
 
@@ -248,6 +248,7 @@ docker run -d \
   postgres:16
 
 # Soviez ERP — omit POSTGRES_DB; inject master password; terminate TLS in front
+sudo mkdir -p /soviez/soviez_web/addons
 docker run -d \
   --name soviez-web \
   --restart unless-stopped \
@@ -259,8 +260,10 @@ docker run -d \
   -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
   -v soviez_filestore:/root/.local/share/Odoo/filestore \
   -v "${HOME}/.soviez:/root/.soviez" \
+  -v /soviez/soviez_web/addons:/root/custom_addons \
   soviez/soviez-erp:latest \
   python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+    --addons-path=/opt/soviez-erp/addons,/opt/soviez-erp/odoo/addons,/root/custom_addons \
     --db_host=soviez-db \
     --db_port=5432 \
     --db_user=soviez \

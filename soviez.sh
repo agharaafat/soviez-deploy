@@ -27,7 +27,9 @@ readonly UPGRADE_MODULES="base,local_license_guard,mail,web,web_enterprise,sovie
 readonly PORT_SCAN_MAX=8999
 readonly PRIMARY_PORT_START=8069
 readonly MULTI_PORT_START=8073
-readonly CUSTOM_ADDONS_CONTAINER_PATH="/var/lib/odoo/custom_addons"
+# Host layout: /soviez/soviez_web[_N]/addons  →  container: /root/custom_addons
+readonly SOVIEZ_HOST_ROOT="/soviez"
+readonly CUSTOM_ADDONS_CONTAINER_PATH="/root/custom_addons"
 readonly BACKUP_ROOT="/var/soviez/backups"
 readonly BACKUP_SAFETY_MARGIN_BYTES=$((5 * 1024 * 1024 * 1024))
 LOG_FILE="/var/log/soviez_setup.log"
@@ -481,6 +483,67 @@ container_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$1"
 }
 
+# Canonical host drop-zone for custom modules (multi-instance under /soviez).
+canonical_custom_addons_host_path() {
+  if [[ -n "${INSTANCE_INDEX}" ]]; then
+    printf '%s\n' "${SOVIEZ_HOST_ROOT}/soviez_web_${INSTANCE_INDEX}/addons"
+  else
+    printf '%s\n' "${SOVIEZ_HOST_ROOT}/soviez_web/addons"
+  fi
+}
+
+legacy_custom_addons_host_path() {
+  if [[ -n "${INSTANCE_INDEX}" ]]; then
+    printf '%s\n' "/etc/soviez_web_${INSTANCE_INDEX}/addons"
+  else
+    printf '%s\n' "/etc/soviez_web/addons"
+  fi
+}
+
+# Resolve CUSTOM_ADDONS_HOST_PATH, migrating legacy /etc/soviez_web* trees when found.
+resolve_custom_addons_host_path() {
+  local canonical legacy current
+  canonical="$(canonical_custom_addons_host_path)"
+  legacy="$(legacy_custom_addons_host_path)"
+  current="${CUSTOM_ADDONS_HOST_PATH:-${SOVIEZ_CUSTOM_ADDONS_HOST:-}}"
+
+  if [[ -z "${current}" ]]; then
+    current="${canonical}"
+  elif [[ "${current}" == /etc/soviez_web* ]]; then
+    current="${canonical}"
+  fi
+
+  CUSTOM_ADDONS_HOST_PATH="${current}"
+
+  # One-shot migrate: move legacy /etc drop-zone into the /soviez tree.
+  if [[ -d "${legacy}" && "${legacy}" != "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
+    mkdir -p "${CUSTOM_ADDONS_HOST_PATH}"
+    if [[ -z "$(ls -A "${CUSTOM_ADDONS_HOST_PATH}" 2>/dev/null || true)" ]]; then
+      # Move module trees; keep a marker so operators know the old path was vacated.
+      shopt -s dotglob nullglob
+      local item
+      for item in "${legacy}"/*; do
+        mv "${item}" "${CUSTOM_ADDONS_HOST_PATH}/" 2>/dev/null || \
+          cp -a "${item}" "${CUSTOM_ADDONS_HOST_PATH}/"
+      done
+      shopt -u dotglob nullglob
+    fi
+    log_file "Migrated custom addons ${legacy} → ${CUSTOM_ADDONS_HOST_PATH}" 2>/dev/null || true
+  fi
+
+  # Keep env sheets pointing at the canonical /soviez layout + container mount.
+  if [[ -n "${ENV_FILE:-}" && -f "${ENV_FILE}" ]]; then
+    if [[ "${SOVIEZ_CUSTOM_ADDONS_HOST:-}" != "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
+      persist_env_key "SOVIEZ_CUSTOM_ADDONS_HOST" "${CUSTOM_ADDONS_HOST_PATH}" 2>/dev/null || true
+    fi
+    if [[ "${SOVIEZ_CUSTOM_ADDONS_MOUNT:-}" != "${CUSTOM_ADDONS_CONTAINER_PATH}" ]]; then
+      persist_env_key "SOVIEZ_CUSTOM_ADDONS_MOUNT" "${CUSTOM_ADDONS_CONTAINER_PATH}" 2>/dev/null || true
+    fi
+  fi
+  SOVIEZ_CUSTOM_ADDONS_HOST="${CUSTOM_ADDONS_HOST_PATH}"
+  SOVIEZ_CUSTOM_ADDONS_MOUNT="${CUSTOM_ADDONS_CONTAINER_PATH}"
+}
+
 apply_topology_primary() {
   ENV_FILE="$(pwd)/.soviez.env"
   if [[ -f "${INSTANCE_ROOT}/.soviez.env" ]]; then
@@ -494,7 +557,7 @@ apply_topology_primary() {
   DB_VOLUME="soviez_db_data"
   FILESTORE_VOLUME="soviez_filestore"
   INSTANCE_INDEX=""
-  CUSTOM_ADDONS_HOST_PATH=""
+  CUSTOM_ADDONS_HOST_PATH="$(canonical_custom_addons_host_path)"
   PORT_SCAN_START="${PRIMARY_PORT_START}"
 }
 
@@ -507,7 +570,7 @@ apply_topology_indexed() {
   WEB_CONTAINER="soviez-web-${index}"
   DB_VOLUME="soviez_db_data_${index}"
   FILESTORE_VOLUME="soviez_filestore_${index}"
-  CUSTOM_ADDONS_HOST_PATH="/etc/soviez_web_${index}/addons"
+  CUSTOM_ADDONS_HOST_PATH="$(canonical_custom_addons_host_path)"
   PORT_SCAN_START="${MULTI_PORT_START}"
 }
 
@@ -750,10 +813,25 @@ resume_postgres_container() {
 
 resume_web_container() {
   if container_running "${WEB_CONTAINER}"; then
+    # Recreate when the custom-addons bind is absent (legacy /etc layout or pre-mount image).
+    if web_needs_addons_remount; then
+      ui_wait "Recycling ${WEB_CONTAINER} to attach custom addons mount..."
+      docker rm -f "${WEB_CONTAINER}" >/dev/null 2>&1 || true
+      launch_web_container
+      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
+      return 0
+    fi
     ui_ok "Web ERP already running (${WEB_CONTAINER})"
     return 0
   fi
   if container_exists "${WEB_CONTAINER}"; then
+    if web_needs_addons_remount; then
+      ui_wait "Recycling stopped ${WEB_CONTAINER} to attach custom addons mount..."
+      docker rm -f "${WEB_CONTAINER}" >/dev/null 2>&1 || true
+      launch_web_container
+      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
+      return 0
+    fi
     ui_wait "Starting stopped web ERP (${WEB_CONTAINER})..."
     docker start "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1
     ui_ok "Web ERP started (${WEB_CONTAINER})"
@@ -764,23 +842,51 @@ resume_web_container() {
   ui_ok "Web ERP created (${WEB_CONTAINER})"
 }
 
+# True when the live container is missing the expected custom-addons bind mount.
+web_needs_addons_remount() {
+  [[ -n "${CUSTOM_ADDONS_HOST_PATH}" ]] || return 1
+  container_exists "${WEB_CONTAINER}" || return 1
+  local mounts
+  mounts="$(docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "${WEB_CONTAINER}" 2>/dev/null || true)"
+  [[ "${mounts}" != *"${CUSTOM_ADDONS_CONTAINER_PATH}"* ]]
+}
+
 ensure_custom_addons_dir() {
+  resolve_custom_addons_host_path
+
   if [[ -z "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
     return 0
   fi
+
+  # Central root-level layout: /soviez/soviez_web[_N]/addons
+  mkdir -p "${SOVIEZ_HOST_ROOT}"
+  mkdir -p "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")"
   mkdir -p "${CUSTOM_ADDONS_HOST_PATH}"
-  chmod 755 "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")" 2>/dev/null || true
-  chmod 755 "${CUSTOM_ADDONS_HOST_PATH}"
+
+  chmod 755 "${SOVIEZ_HOST_ROOT}" \
+    "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")" \
+    "${CUSTOM_ADDONS_HOST_PATH}"
+
+  # Allow the invoking operator (via sudo) to drop modules without staying root.
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    chown "${SUDO_USER}:${SUDO_USER}" \
+      "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")" \
+      "${CUSTOM_ADDONS_HOST_PATH}" 2>/dev/null || true
+  fi
+
   # Friendly README on first create
   if [[ ! -f "${CUSTOM_ADDONS_HOST_PATH}/README.txt" ]]; then
     cat > "${CUSTOM_ADDONS_HOST_PATH}/README.txt" <<EOF
 Soviez ERP — custom addons drop folder for ${WEB_CONTAINER}
 
 Place Odoo/Soviez modules here (each module in its own subdirectory).
-They are mounted read/write into the container at:
+They are bind-mounted into the container at:
   ${CUSTOM_ADDONS_CONTAINER_PATH}
 
-After dropping a module, update the database apps list from the UI
+Runtime --addons-path includes that directory last:
+  /opt/soviez-erp/addons,/opt/soviez-erp/odoo/addons,${CUSTOM_ADDONS_CONTAINER_PATH}
+
+After dropping a module, update the database Apps list from the UI
 or run: sudo ./soviez.sh --update
 EOF
   fi
@@ -1663,9 +1769,7 @@ load_tenant_from_env_path() {
   FILESTORE_VOLUME="${SOVIEZ_FILESTORE_VOLUME:-${FILESTORE_VOLUME}}"
   INSTANCE_INDEX="${SOVIEZ_INSTANCE_INDEX:-}"
   CUSTOM_ADDONS_HOST_PATH="${SOVIEZ_CUSTOM_ADDONS_HOST:-${CUSTOM_ADDONS_HOST_PATH}}"
-  if [[ -z "${CUSTOM_ADDONS_HOST_PATH}" && -n "${INSTANCE_INDEX}" ]]; then
-    CUSTOM_ADDONS_HOST_PATH="/etc/soviez_web_${INSTANCE_INDEX}/addons"
-  fi
+  resolve_custom_addons_host_path
   TENANT_DOMAIN="${SOVIEZ_TENANT_DOMAIN:-}"
 }
 
@@ -1918,9 +2022,7 @@ mode_formsetup() {
   FILESTORE_VOLUME="${SOVIEZ_FILESTORE_VOLUME:-${FILESTORE_VOLUME}}"
   INSTANCE_INDEX="${SOVIEZ_INSTANCE_INDEX:-${target_index}}"
   CUSTOM_ADDONS_HOST_PATH="${SOVIEZ_CUSTOM_ADDONS_HOST:-${CUSTOM_ADDONS_HOST_PATH}}"
-  if [[ -z "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
-    CUSTOM_ADDONS_HOST_PATH="/etc/soviez_web_${INSTANCE_INDEX}/addons"
-  fi
+  resolve_custom_addons_host_path
   TENANT_DOMAIN="${SOVIEZ_TENANT_DOMAIN:-}"
 
   if [[ -z "${TENANT_DOMAIN}" ]]; then
@@ -2139,9 +2241,7 @@ mode_update() {
     FILESTORE_VOLUME="${SOVIEZ_FILESTORE_VOLUME:-${FILESTORE_VOLUME}}"
     INSTANCE_INDEX="${SOVIEZ_INSTANCE_INDEX:-}"
     CUSTOM_ADDONS_HOST_PATH="${SOVIEZ_CUSTOM_ADDONS_HOST:-}"
-    if [[ -z "${CUSTOM_ADDONS_HOST_PATH}" && -n "${INSTANCE_INDEX}" ]]; then
-      CUSTOM_ADDONS_HOST_PATH="/etc/soviez_web_${INSTANCE_INDEX}/addons"
-    fi
+    resolve_custom_addons_host_path
 
     if ! container_running "${DB_CONTAINER}"; then
       if container_exists "${DB_CONTAINER}"; then
@@ -2202,6 +2302,7 @@ mode_recover() {
   FILESTORE_VOLUME="${SOVIEZ_FILESTORE_VOLUME:-${FILESTORE_VOLUME}}"
   INSTANCE_INDEX="${SOVIEZ_INSTANCE_INDEX:-}"
   CUSTOM_ADDONS_HOST_PATH="${SOVIEZ_CUSTOM_ADDONS_HOST:-}"
+  resolve_custom_addons_host_path
 
   if [[ -z "${SOVIEZ_CONTAINER_MAC:-}" || -z "${SOVIEZ_DB_PASSWORD:-}" || -z "${SOVIEZ_HOST_PORT:-}" ]]; then
     ui_error "${ENV_FILE} is incomplete — cannot recover master password."
