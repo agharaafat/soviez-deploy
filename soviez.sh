@@ -1590,21 +1590,129 @@ addons_cli_for_runtime() {
   printf '%s\n' "${addons_cli}"
 }
 
-# Write Odoo login password via shell on the LIVE web container (correct hashing).
-# Uses docker exec — never a second docker run with the same --mac-address (that races/fails).
+# Volume mounts shared by one-shot maintenance containers (provision / password / upgrades).
+# No --mac-address here — that belongs only on the long-running web container.
+odoo_maintenance_volume_args() {
+  local -n _out="$1"
+  local runtime_conf
+  _out=(
+    -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
+    -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
+  )
+  ensure_host_ledger_dir
+  ensure_custom_addons_dir
+  ensure_tenant_odoo_conf
+  runtime_conf="$(tenant_odoo_conf_path)"
+  if [[ -f "${runtime_conf}" ]]; then
+    _out+=(-v "${runtime_conf}:/opt/soviez-erp/tenant.odoo.conf:ro")
+  fi
+  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
+    _out+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
+  fi
+}
+
+# Stop the live web ERP so a maintenance one-shot can own filestore/DB locks.
+# Never run -i / shell --stop-after-init via docker exec against a live Odoo PID.
+stop_web_for_maintenance() {
+  if container_running "${WEB_CONTAINER}"; then
+    ui_wait "Stopping ${WEB_CONTAINER} for database maintenance..."
+    docker stop "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  fi
+}
+
+# Config path inside maintenance one-shots (tenant bind if present, else image default).
+odoo_maintenance_conf_path() {
+  local runtime_conf
+  runtime_conf="$(tenant_odoo_conf_path)"
+  if [[ -f "${runtime_conf}" ]]; then
+    printf '%s\n' "/opt/soviez-erp/tenant.odoo.conf"
+  else
+    printf '%s\n' "/opt/soviez-erp/soviez.conf"
+  fi
+}
+
+# One-shot Odoo job on the tenant network (no MAC — never clashes with soviez-web-N).
+# Extra args are appended after the common soviez-bin connection flags.
+# Usage: run_odoo_maintenance -- -d production -i base,... --without-demo=all --stop-after-init
+#    or: printf script | run_odoo_maintenance_stdin -- -d production --stop-after-init shell
+run_odoo_maintenance() {
+  local addons_cli conf_path
+  local -a volume_args=()
+  local rc=0
+
+  wait_for_postgres || return 1
+  stop_web_for_maintenance
+  odoo_maintenance_volume_args volume_args
+  addons_cli="$(addons_cli_for_runtime)"
+  conf_path="$(odoo_maintenance_conf_path)"
+
+  set +e
+  docker run --rm \
+    --network "${NETWORK_NAME}" \
+    -e POSTGRES_USER=soviez \
+    -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    "${volume_args[@]}" \
+    "${APP_IMAGE}" \
+    python3 soviez-bin -c "${conf_path}" \
+      --addons-path="${addons_cli}" \
+      --db_host="${DB_CONTAINER}" \
+      --db_port=5432 \
+      --db_user=soviez \
+      --db_password="${SOVIEZ_DB_PASSWORD}" \
+      --data-dir=/root/.local/share/Odoo \
+      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
+      "$@" >>"${LOG_FILE}" 2>&1
+  rc=$?
+  set -e
+  return "${rc}"
+}
+
+# Same as run_odoo_maintenance but keeps stdin open (for Odoo shell scripts).
+run_odoo_maintenance_stdin() {
+  local addons_cli conf_path
+  local -a volume_args=()
+  local rc=0
+
+  wait_for_postgres || return 1
+  stop_web_for_maintenance
+  odoo_maintenance_volume_args volume_args
+  addons_cli="$(addons_cli_for_runtime)"
+  conf_path="$(odoo_maintenance_conf_path)"
+
+  set +e
+  docker run --rm -i \
+    --network "${NETWORK_NAME}" \
+    -e POSTGRES_USER=soviez \
+    -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e "SOVIEZ_RESET_LOGIN_B64=${SOVIEZ_RESET_LOGIN_B64:-}" \
+    -e "SOVIEZ_RESET_PASS_B64=${SOVIEZ_RESET_PASS_B64:-}" \
+    "${volume_args[@]}" \
+    "${APP_IMAGE}" \
+    python3 soviez-bin -c "${conf_path}" \
+      --addons-path="${addons_cli}" \
+      --db_host="${DB_CONTAINER}" \
+      --db_port=5432 \
+      --db_user=soviez \
+      --db_password="${SOVIEZ_DB_PASSWORD}" \
+      --data-dir=/root/.local/share/Odoo \
+      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
+      "$@" >>"${LOG_FILE}" 2>&1
+  rc=$?
+  set -e
+  return "${rc}"
+}
+
+# Write Odoo login password via shell (correct hashing — never raw SQL).
+# Uses a one-shot container with web stopped (no MAC clash, no dual Odoo PIDs).
 set_odoo_user_password() {
   local dbname="$1"
   local login="$2"
   local passwd="$3"
   local py_script rc=0 login_b64 pass_b64
-  local addons_cli
 
   assert_safe_dbname "${dbname}"
-  if ! container_running "${WEB_CONTAINER}"; then
-    ui_error "Web container ${WEB_CONTAINER} must be running to set passwords"
-    return 1
-  fi
-  addons_cli="$(addons_cli_for_runtime)"
 
   login_b64="$(printf '%s' "${login}" | base64 | tr -d '\n')"
   pass_b64="$(printf '%s' "${passwd}" | base64 | tr -d '\n')"
@@ -1624,31 +1732,21 @@ print(f"OK password updated for login={login} uid={user.id}")
 PY
 )"
 
+  SOVIEZ_RESET_LOGIN_B64="${login_b64}"
+  SOVIEZ_RESET_PASS_B64="${pass_b64}"
   set +e
-  printf '%s\n' "${py_script}" | docker exec -i \
-      -e "SOVIEZ_RESET_LOGIN_B64=${login_b64}" \
-      -e "SOVIEZ_RESET_PASS_B64=${pass_b64}" \
-      -u root \
-      "${WEB_CONTAINER}" \
-      python3 soviez-bin -c /opt/soviez-erp/tenant.odoo.conf \
-        --addons-path="${addons_cli}" \
-        --db_host="${DB_CONTAINER}" \
-        --db_port=5432 \
-        --db_user=soviez \
-        --db_password="${SOVIEZ_DB_PASSWORD}" \
-        --data-dir=/root/.local/share/Odoo \
-        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
-        -d "${dbname}" --stop-after-init shell >>"${LOG_FILE}" 2>&1
+  printf '%s\n' "${py_script}" | run_odoo_maintenance_stdin \
+    -d "${dbname}" --stop-after-init shell
   rc=$?
   set -e
+  unset SOVIEZ_RESET_LOGIN_B64 SOVIEZ_RESET_PASS_B64
   return "${rc}"
 }
 
-# Create (or refresh) the application DB via docker exec on the running web container.
+# Create (or refresh) the application DB via a one-shot container (web must be down).
 # FORCE_NEW_APP_PASSWORD=1 forces a fresh random password (used by --rebuild).
 provision_application_database() {
   local dbname="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
-  local addons_cli
   local install_rc=0
   local app_password=""
 
@@ -1660,11 +1758,6 @@ provision_application_database() {
     return 1
   }
 
-  if ! container_running "${WEB_CONTAINER}"; then
-    ui_error "Web container ${WEB_CONTAINER} must be running before provisioning"
-    return 1
-  fi
-
   if [[ "${FORCE_NEW_APP_PASSWORD:-0}" == "1" || -z "${SOVIEZ_APP_PASSWORD:-}" ]]; then
     app_password="$(generate_app_password)"
   else
@@ -1672,33 +1765,22 @@ provision_application_database() {
   fi
   SOVIEZ_APP_PASSWORD="${app_password}"
 
-  addons_cli="$(addons_cli_for_runtime)"
-
   if pg_database_exists "${dbname}"; then
     ui_info "Application database '${dbname}' already present — ensuring admin credentials"
   else
-    ui_wait "Creating application database '${dbname}' and installing core modules (docker exec)..."
-    log_file "provision_application_database: docker exec ${WEB_CONTAINER} -i ${UPGRADE_MODULES} -d ${dbname}"
+    ui_wait "Creating application database '${dbname}' and installing core modules..."
+    log_file "provision_application_database: oneshot -i ${UPGRADE_MODULES} -d ${dbname}"
     set +e
-    docker exec -u root \
-      "${WEB_CONTAINER}" \
-      python3 soviez-bin -c /opt/soviez-erp/tenant.odoo.conf \
-        --addons-path="${addons_cli}" \
-        --db_host="${DB_CONTAINER}" \
-        --db_port=5432 \
-        --db_user=soviez \
-        --db_password="${SOVIEZ_DB_PASSWORD}" \
-        --data-dir=/root/.local/share/Odoo \
-        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
-        -d "${dbname}" \
-        -i "${UPGRADE_MODULES}" \
-        --without-demo=all \
-        --stop-after-init >>"${LOG_FILE}" 2>&1
+    run_odoo_maintenance \
+      -d "${dbname}" \
+      -i "${UPGRADE_MODULES}" \
+      --without-demo=all \
+      --stop-after-init
     install_rc=$?
     set -e
     if (( install_rc != 0 )); then
       ui_error "Database provisioning failed for '${dbname}' (exit ${install_rc}) — see ${LOG_FILE}"
-      ui_error "Hint: docker logs ${WEB_CONTAINER}; tail -n 80 ${LOG_FILE}"
+      ui_error "Hint: tail -n 120 ${LOG_FILE}"
       return "${install_rc}"
     fi
     ui_ok "Database '${dbname}' created with core modules"
@@ -1719,18 +1801,21 @@ provision_application_database() {
 }
 
 # Shared core pipeline for --new / --formsetup / --rebuild.
+# Order: DB → provision (web down) → web → optional tune → optional SSL.
 # do_tune: 0|1   do_ssl: 0|1
 run_tenant_core_pipeline() {
   local do_tune="${1:-0}"
   local do_ssl="${2:-0}"
 
   show_progress "Starting PostgreSQL (${DB_CONTAINER})..." start_db_container || return 1
-  show_progress "Starting Soviez ERP (${WEB_CONTAINER})..." start_web_container 0 || return 1
 
+  # Provision before (or with) web stopped — never docker exec -i against a live Odoo.
   SOVIEZ_DB_NAME="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
   show_progress "Provisioning application database (${SOVIEZ_DB_NAME})..." \
     provision_application_database || return 1
   load_env_file
+
+  show_progress "Starting Soviez ERP (${WEB_CONTAINER})..." start_web_container 0 || return 1
 
   if (( do_tune == 1 )); then
     ui_info "Running intelligent auto-configuration for ${WEB_CONTAINER}..."
