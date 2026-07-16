@@ -893,7 +893,7 @@ recycle_postgres_engine() {
   ui_warn "${reason} — recreating ${DB_CONTAINER} (data volume ${DB_VOLUME} preserved)..."
   docker stop "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
   docker rm -f "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
-  run_postgres_container || return 1
+  _docker_run_postgres_container || return 1
   wait_for_postgres || return 1
   ui_ok "PostgreSQL recreated (${DB_CONTAINER})"
   return 0
@@ -1151,10 +1151,10 @@ postgres_shm_size() {
   fi
 }
 
-# Launch (or recreate) the tenant Postgres engine. CMD args are separate words —
-# NEVER serialize via $(…) with NULs (bash strips \\0 and concatenates into
-# "postgres-cshared_buffers=…", which is exactly the Safe Restart crash).
-run_postgres_container() {
+# Low-level docker run for the Postgres engine (single source of truth).
+# CMD args are separate words — NEVER serialize via $(…) with NULs (bash strips
+# \\0 and concatenates into "postgres-cshared_buffers=…", the Safe Restart crash).
+_docker_run_postgres_container() {
   local shared_mb="${SOVIEZ_PG_SHARED_BUFFERS_MB:-${PG_SHARED_MB:-}}"
   local effective_mb="${SOVIEZ_PG_EFFECTIVE_CACHE_MB:-${PG_EFFECTIVE_MB:-}}"
   local shm_size
@@ -1203,9 +1203,54 @@ run_postgres_container() {
   return 0
 }
 
+
+# Canonical DB bring-up used by --new / --formsetup / --rebuild / Safe Restart.
+start_db_container() {
+  if container_exists "${DB_CONTAINER}"; then
+    if postgres_cmd_is_mangled; then
+      recycle_postgres_engine "Broken PostgreSQL launch command on ${DB_CONTAINER}" || return 1
+      return 0
+    fi
+    local st
+    st="$(postgres_engine_state)"
+    case "${st}" in
+      restarting|dead|exited|created)
+        recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} state=${st}" || return 1
+        return 0
+        ;;
+    esac
+    if container_running "${DB_CONTAINER}"; then
+      log_file "DB ${DB_CONTAINER} already running"
+      if wait_for_postgres; then
+        ui_ok "PostgreSQL ready (${DB_CONTAINER})"
+        return 0
+      fi
+      recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} is up but not accepting connections" || return 1
+      return 0
+    fi
+    docker start "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+    if wait_for_postgres; then
+      ui_ok "PostgreSQL started (${DB_CONTAINER})"
+      return 0
+    fi
+    recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} failed to become ready after start" || return 1
+    return 0
+  fi
+
+  ui_wait "Creating PostgreSQL (${DB_CONTAINER})..."
+  _docker_run_postgres_container || return 1
+  wait_for_postgres || return 1
+  ui_ok "PostgreSQL created (${DB_CONTAINER}, shm-size=$(postgres_shm_size))"
+}
+
+# Back-compat aliases
+run_postgres_container() { _docker_run_postgres_container "$@"; }
+ensure_postgres_container() { start_db_container "$@"; }
+resume_postgres_container() { start_db_container "$@"; }
+
 recreate_postgres_with_tuning() {
   ui_wait "Recreating ${DB_CONTAINER} on volume ${DB_VOLUME} with tuned PostgreSQL buffers..."
-  run_postgres_container || return 1
+  _docker_run_postgres_container || return 1
   wait_for_postgres || return 1
   ui_ok "PostgreSQL ${DB_CONTAINER} online with tuned buffers (shm-size=$(postgres_shm_size))"
 }
@@ -1280,110 +1325,6 @@ prompt_resource_tuning_on_new() {
   fi
 }
 
-ensure_postgres_container() {
-  if container_exists "${DB_CONTAINER}"; then
-    if postgres_cmd_is_mangled; then
-      recycle_postgres_engine "Broken PostgreSQL launch command on ${DB_CONTAINER}" || return 1
-      return 0
-    fi
-    local st
-    st="$(postgres_engine_state)"
-    case "${st}" in
-      restarting|dead|exited|created)
-        recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} state=${st}" || return 1
-        return 0
-        ;;
-    esac
-    if container_running "${DB_CONTAINER}"; then
-      log_file "DB ${DB_CONTAINER} already running"
-      if wait_for_postgres; then
-        return 0
-      fi
-      recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} is up but not accepting connections" || return 1
-      return 0
-    fi
-    docker start "${DB_CONTAINER}" >/dev/null 2>&1 || true
-    if wait_for_postgres; then
-      return 0
-    fi
-    recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} failed to become ready after start" || return 1
-    return 0
-  fi
-  run_postgres_container || return 1
-  wait_for_postgres
-}
-
-resume_postgres_container() {
-  if ! container_exists "${DB_CONTAINER}"; then
-    ui_wait "Creating PostgreSQL (${DB_CONTAINER})..."
-    ensure_postgres_container || return 1
-    ui_ok "PostgreSQL created (${DB_CONTAINER})"
-    return 0
-  fi
-
-  if postgres_cmd_is_mangled; then
-    recycle_postgres_engine "Broken PostgreSQL launch command (mangled -c flags) on ${DB_CONTAINER}" || return 1
-    return 0
-  fi
-
-  local st
-  st="$(postgres_engine_state)"
-  case "${st}" in
-    restarting|dead|exited|created)
-      recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} state=${st}" || return 1
-      return 0
-      ;;
-  esac
-
-  if container_running "${DB_CONTAINER}"; then
-    ui_ok "PostgreSQL already running (${DB_CONTAINER})"
-    if wait_for_postgres; then
-      return 0
-    fi
-    # Typical after the Safe Restart argv bug: container "Up"/"Restarting" but pg_isready never succeeds.
-    recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} not accepting connections" || return 1
-    return 0
-  fi
-
-  ui_wait "Starting stopped PostgreSQL (${DB_CONTAINER})..."
-  docker start "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
-  if wait_for_postgres; then
-    ui_ok "PostgreSQL started (${DB_CONTAINER})"
-    return 0
-  fi
-  recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} failed to become ready after start" || return 1
-}
-
-resume_web_container() {
-  if container_running "${WEB_CONTAINER}"; then
-    # Recreate when the custom-addons bind is absent (legacy /etc layout or pre-mount image).
-    if web_needs_addons_remount; then
-      ui_wait "Recycling ${WEB_CONTAINER} to attach custom addons mount..."
-      docker rm -f "${WEB_CONTAINER}" >/dev/null 2>&1 || true
-      launch_web_container
-      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
-      return 0
-    fi
-    ui_ok "Web ERP already running (${WEB_CONTAINER})"
-    return 0
-  fi
-  if container_exists "${WEB_CONTAINER}"; then
-    if web_needs_addons_remount; then
-      ui_wait "Recycling stopped ${WEB_CONTAINER} to attach custom addons mount..."
-      docker rm -f "${WEB_CONTAINER}" >/dev/null 2>&1 || true
-      launch_web_container
-      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
-      return 0
-    fi
-    ui_wait "Starting stopped web ERP (${WEB_CONTAINER})..."
-    docker start "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1
-    ui_ok "Web ERP started (${WEB_CONTAINER})"
-    return 0
-  fi
-  ui_wait "Creating web ERP (${WEB_CONTAINER})..."
-  launch_web_container
-  ui_ok "Web ERP created (${WEB_CONTAINER})"
-}
 
 # True when the live container is missing the expected custom-addons bind mount.
 web_needs_addons_remount() {
@@ -1401,7 +1342,6 @@ ensure_custom_addons_dir() {
     return 0
   fi
 
-  # Central root-level layout: /soviez/soviez_web[_N]/addons
   mkdir -p "${SOVIEZ_HOST_ROOT}"
   mkdir -p "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")"
   mkdir -p "${CUSTOM_ADDONS_HOST_PATH}"
@@ -1410,14 +1350,12 @@ ensure_custom_addons_dir() {
     "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")" \
     "${CUSTOM_ADDONS_HOST_PATH}"
 
-  # Allow the invoking operator (via sudo) to drop modules without staying root.
   if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
     chown "${SUDO_USER}:${SUDO_USER}" \
       "$(dirname "${CUSTOM_ADDONS_HOST_PATH}")" \
       "${CUSTOM_ADDONS_HOST_PATH}" 2>/dev/null || true
   fi
 
-  # Friendly README on first create
   if [[ ! -f "${CUSTOM_ADDONS_HOST_PATH}/README.txt" ]]; then
     cat > "${CUSTOM_ADDONS_HOST_PATH}/README.txt" <<EOF
 Soviez ERP — custom addons drop folder for ${WEB_CONTAINER}
@@ -1435,9 +1373,11 @@ EOF
   fi
 }
 
-launch_web_container() {
+# Low-level docker run for the web/ERP container (single source of truth).
+_docker_run_web_container() {
   local addons_cli runtime_conf
   local -a volume_args=() docker_limits=()
+  local run_rc=0
 
   ensure_host_ledger_dir
   ensure_custom_addons_dir
@@ -1465,6 +1405,7 @@ launch_web_container() {
     docker_limits+=(--memory="${SOVIEZ_DOCKER_MEM_MB}m" --memory-swap="${SOVIEZ_DOCKER_MEM_MB}m")
   fi
 
+  set +e
   docker run -d \
     --name "${WEB_CONTAINER}" \
     --restart unless-stopped \
@@ -1484,8 +1425,66 @@ launch_web_container() {
       --db_user=soviez \
       --db_password="${SOVIEZ_DB_PASSWORD}" \
       --data-dir=/root/.local/share/Odoo \
-      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" >/dev/null
+      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" >>"${LOG_FILE}" 2>&1
+  run_rc=$?
+  set -e
+
+  if (( run_rc != 0 )); then
+    ui_error "Failed to start ${WEB_CONTAINER} (docker run exit ${run_rc}) — see ${LOG_FILE}"
+    return "${run_rc}"
+  fi
+  return 0
 }
+
+# Canonical web bring-up used by --new / --formsetup / --rebuild / --update.
+# Pass 1 to force recreate even if a container already exists.
+start_web_container() {
+  local force="${1:-0}"
+
+  ensure_host_ledger_dir
+  ensure_custom_addons_dir
+  ensure_tenant_odoo_conf
+
+  if (( force == 1 )) && container_exists "${WEB_CONTAINER}"; then
+    docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  fi
+
+  if container_running "${WEB_CONTAINER}"; then
+    if web_needs_addons_remount; then
+      ui_wait "Recycling ${WEB_CONTAINER} to attach custom addons mount..."
+      docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+      _docker_run_web_container || return 1
+      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
+      return 0
+    fi
+    ui_ok "Web ERP already running (${WEB_CONTAINER})"
+    return 0
+  fi
+
+  if container_exists "${WEB_CONTAINER}"; then
+    if web_needs_addons_remount; then
+      ui_wait "Recycling stopped ${WEB_CONTAINER} to attach custom addons mount..."
+      docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+      _docker_run_web_container || return 1
+      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
+      return 0
+    fi
+    ui_wait "Starting stopped web ERP (${WEB_CONTAINER})..."
+    if docker start "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1; then
+      ui_ok "Web ERP started (${WEB_CONTAINER})"
+      return 0
+    fi
+    ui_warn "docker start failed for ${WEB_CONTAINER} — recreating..."
+    docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  fi
+
+  ui_wait "Creating web ERP (${WEB_CONTAINER})..."
+  _docker_run_web_container || return 1
+  ui_ok "Web ERP created (${WEB_CONTAINER})"
+}
+
+launch_web_container() { start_web_container 1; }
+resume_web_container() { start_web_container 0; }
 
 # ===========================================================================
 list_odoo_databases() {
@@ -1591,24 +1590,21 @@ addons_cli_for_runtime() {
   printf '%s\n' "${addons_cli}"
 }
 
-# Write Odoo login password via shell (correct hashing — never raw SQL).
+# Write Odoo login password via shell on the LIVE web container (correct hashing).
+# Uses docker exec — never a second docker run with the same --mac-address (that races/fails).
 set_odoo_user_password() {
   local dbname="$1"
   local login="$2"
   local passwd="$3"
   local py_script rc=0 login_b64 pass_b64
   local addons_cli
-  local -a volume_args=(
-    -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
-    -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
-  )
 
   assert_safe_dbname "${dbname}"
-  ensure_host_ledger_dir
-  addons_cli="$(addons_cli_for_runtime)"
-  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
-    volume_args+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
+  if ! container_running "${WEB_CONTAINER}"; then
+    ui_error "Web container ${WEB_CONTAINER} must be running to set passwords"
+    return 1
   fi
+  addons_cli="$(addons_cli_for_runtime)"
 
   login_b64="$(printf '%s' "${login}" | base64 | tr -d '\n')"
   pass_b64="$(printf '%s' "${passwd}" | base64 | tr -d '\n')"
@@ -1629,15 +1625,12 @@ PY
 )"
 
   set +e
-  printf '%s\n' "${py_script}" | docker run --rm -i \
-      --network "${NETWORK_NAME}" \
+  printf '%s\n' "${py_script}" | docker exec -i \
       -e "SOVIEZ_RESET_LOGIN_B64=${login_b64}" \
       -e "SOVIEZ_RESET_PASS_B64=${pass_b64}" \
-      -e POSTGRES_USER=soviez \
-      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      "${volume_args[@]}" \
-      "${APP_IMAGE}" \
-      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+      -u root \
+      "${WEB_CONTAINER}" \
+      python3 soviez-bin -c /opt/soviez-erp/tenant.odoo.conf \
         --addons-path="${addons_cli}" \
         --db_host="${DB_CONTAINER}" \
         --db_port=5432 \
@@ -1651,44 +1644,45 @@ PY
   return "${rc}"
 }
 
-# Create (or refresh) the application DB, install core modules, set a random admin password.
+# Create (or refresh) the application DB via docker exec on the running web container.
+# FORCE_NEW_APP_PASSWORD=1 forces a fresh random password (used by --rebuild).
 provision_application_database() {
   local dbname="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
   local addons_cli
-  local -a volume_args=(
-    -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
-    -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
-  )
   local install_rc=0
   local app_password=""
 
   assert_safe_dbname "${dbname}"
   ensure_host_ledger_dir
-  wait_for_postgres || return 1
 
-  # Always mint a fresh ERP login password on provision / rebuild.
-  app_password="$(generate_app_password)"
+  wait_for_postgres || {
+    ui_error "PostgreSQL not ready — cannot provision application database"
+    return 1
+  }
+
+  if ! container_running "${WEB_CONTAINER}"; then
+    ui_error "Web container ${WEB_CONTAINER} must be running before provisioning"
+    return 1
+  fi
+
+  if [[ "${FORCE_NEW_APP_PASSWORD:-0}" == "1" || -z "${SOVIEZ_APP_PASSWORD:-}" ]]; then
+    app_password="$(generate_app_password)"
+  else
+    app_password="${SOVIEZ_APP_PASSWORD}"
+  fi
   SOVIEZ_APP_PASSWORD="${app_password}"
 
   addons_cli="$(addons_cli_for_runtime)"
-  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
-    volume_args+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
-  fi
 
   if pg_database_exists "${dbname}"; then
-    ui_info "Application database '${dbname}' already present — rotating admin credentials"
+    ui_info "Application database '${dbname}' already present — ensuring admin credentials"
   else
-    ui_wait "Creating application database '${dbname}' and installing core modules..."
+    ui_wait "Creating application database '${dbname}' and installing core modules (docker exec)..."
+    log_file "provision_application_database: docker exec ${WEB_CONTAINER} -i ${UPGRADE_MODULES} -d ${dbname}"
     set +e
-    docker run --rm \
-      --network "${NETWORK_NAME}" \
-      --mac-address "${SOVIEZ_CONTAINER_MAC}" \
-      -e POSTGRES_USER=soviez \
-      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      "${volume_args[@]}" \
-      "${APP_IMAGE}" \
-      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+    docker exec -u root \
+      "${WEB_CONTAINER}" \
+      python3 soviez-bin -c /opt/soviez-erp/tenant.odoo.conf \
         --addons-path="${addons_cli}" \
         --db_host="${DB_CONTAINER}" \
         --db_port=5432 \
@@ -1704,6 +1698,7 @@ provision_application_database() {
     set -e
     if (( install_rc != 0 )); then
       ui_error "Database provisioning failed for '${dbname}' (exit ${install_rc}) — see ${LOG_FILE}"
+      ui_error "Hint: docker logs ${WEB_CONTAINER}; tail -n 80 ${LOG_FILE}"
       return "${install_rc}"
     fi
     ui_ok "Database '${dbname}' created with core modules"
@@ -1714,17 +1709,70 @@ provision_application_database() {
     ui_error "Failed to set admin password — see ${LOG_FILE}"
     return 1
   fi
-  ui_ok "Admin credentials ready (${DEFAULT_APP_LOGIN} / random ${APP_PASSWORD_LEN}-char password)"
+  ui_ok "Admin credentials ready (${DEFAULT_APP_LOGIN} / ${APP_PASSWORD_LEN}-char password)"
 
   persist_env_key "SOVIEZ_DB_NAME" "${dbname}"
   persist_env_key "SOVIEZ_APP_PASSWORD" "${app_password}"
   SOVIEZ_DB_NAME="${dbname}"
+  SOVIEZ_APP_PASSWORD="${app_password}"
+  return 0
+}
+
+# Shared core pipeline for --new / --formsetup / --rebuild.
+# do_tune: 0|1   do_ssl: 0|1
+run_tenant_core_pipeline() {
+  local do_tune="${1:-0}"
+  local do_ssl="${2:-0}"
+
+  show_progress "Starting PostgreSQL (${DB_CONTAINER})..." start_db_container || return 1
+  show_progress "Starting Soviez ERP (${WEB_CONTAINER})..." start_web_container 0 || return 1
+
+  SOVIEZ_DB_NAME="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
+  show_progress "Provisioning application database (${SOVIEZ_DB_NAME})..." \
+    provision_application_database || return 1
+  load_env_file
+
+  if (( do_tune == 1 )); then
+    ui_info "Running intelligent auto-configuration for ${WEB_CONTAINER}..."
+    compute_allocation_for_tenant "${WEB_CONTAINER}"
+    apply_tenant_resource_tuning || ui_warn "Auto-tuning failed — retry with: sudo ./soviez.sh --formworkers ${WEB_CONTAINER}"
+  fi
+
+  if (( do_ssl == 1 )); then
+    local domain="${TENANT_DOMAIN:-${SOVIEZ_TENANT_DOMAIN:-}}"
+    if [[ -z "${domain}" ]]; then
+      ui_error "No tenant domain set — cannot provision HTTPS"
+      return 1
+    fi
+    ui_wait "Provisioning Nginx + HTTPS for ${domain}..."
+    if ! provision_tenant_https "${domain}" "${SOVIEZ_HOST_PORT}"; then
+      ui_error "HTTPS provisioning failed — see ${LOG_FILE}"
+      return 1
+    fi
+    persist_env_key "SOVIEZ_SSL_MODE" "${SSL_STATUS}"
+    persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
+    ui_ok "HTTPS pipeline complete for ${domain} (${SSL_STATUS})"
+    verify_and_heal_tenant_https "${domain}" "${SOVIEZ_HOST_PORT}"
+  fi
+
   return 0
 }
 
 print_tenant_login_banner() {
   local domain="$1"
-  local password="${2:-${SOVIEZ_APP_PASSWORD:-}}"
+  local password="${2:-}"
+
+  # Prefer explicit arg, then shell var, then env sheet (formsetup may not have provisioned yet in older runs).
+  if [[ -z "${password}" ]]; then
+    password="${SOVIEZ_APP_PASSWORD:-}"
+  fi
+  if [[ -z "${password}" && -n "${ENV_FILE:-}" && -f "${ENV_FILE}" ]]; then
+    password="$(grep -E '^SOVIEZ_APP_PASSWORD=' "${ENV_FILE}" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  fi
+  if [[ -n "${password}" ]]; then
+    SOVIEZ_APP_PASSWORD="${password}"
+  fi
+
   echo ""
   echo -e "${C_GREEN}${C_BOLD}==============================================================${C_RESET}"
   echo -e "${C_GREEN}${C_BOLD}🎉 Tenant provisioned successfully!${C_RESET}"
@@ -1734,7 +1782,7 @@ print_tenant_login_banner() {
   if [[ -n "${password}" ]]; then
     echo -e "  ${C_BOLD}🔑 Password:${C_RESET}   ${C_RED}${C_BOLD}${password}${C_RESET}"
   else
-    echo -e "  ${C_BOLD}🔑 Password:${C_RESET}   ${C_DIM}(see SOVIEZ_APP_PASSWORD in ${ENV_FILE})${C_RESET}"
+    echo -e "  ${C_BOLD}🔑 Password:${C_RESET}   ${C_YELLOW}${C_BOLD}(unavailable — re-run provisioning)${C_RESET}"
   fi
   echo -e "  ${C_YELLOW}${C_BOLD}Save this password now — change it after first login.${C_RESET}"
   echo -e "${C_GREEN}${C_BOLD}==============================================================${C_RESET}"
@@ -2795,6 +2843,11 @@ print_elite_welcome() {
   local index="$3"
   local app_password="${SOVIEZ_APP_PASSWORD:-}"
 
+  if [[ -z "${app_password}" && -n "${ENV_FILE:-}" && -f "${ENV_FILE}" ]]; then
+    app_password="$(grep -E '^SOVIEZ_APP_PASSWORD=' "${ENV_FILE}" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+    [[ -n "${app_password}" ]] && SOVIEZ_APP_PASSWORD="${app_password}"
+  fi
+
   clear 2>/dev/null || true
   echo ""
   echo -e "${C_GREEN}${C_BOLD}"
@@ -2951,37 +3004,18 @@ SOVIEZ_DB_NAME=${DEFAULT_APP_DB_NAME}
 EOF
   chmod 600 "${ENV_FILE}"
   SOVIEZ_DB_NAME="${DEFAULT_APP_DB_NAME}"
+  load_env_file
 
   show_progress "Pulling container images..." bash -c \
     "docker pull '${APP_IMAGE}' && docker pull '${DB_IMAGE}'"
 
   show_progress "Creating network and volumes..." ensure_network_and_volumes
-  show_progress "Starting PostgreSQL (${DB_CONTAINER})..." ensure_postgres_container
 
-  if container_exists "${WEB_CONTAINER}"; then
-    docker rm -f "${WEB_CONTAINER}" >/dev/null 2>&1 || true
-  fi
-  show_progress "Launching Soviez ERP (${WEB_CONTAINER})..." launch_web_container
-
-  if ! provision_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"; then
-    ui_error "HTTPS provisioning failed — see ${LOG_FILE}"
+  # Shared pipeline: DB → web → provision → tune → SSL
+  if ! run_tenant_core_pipeline "${AUTO_TUNE_ON_NEW}" 1; then
+    ui_error "Tenant core pipeline failed — see ${LOG_FILE}"
     exit 1
   fi
-  persist_env_key "SOVIEZ_SSL_MODE" "${SSL_STATUS}"
-  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
-  verify_and_heal_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"
-
-  if (( AUTO_TUNE_ON_NEW == 1 )); then
-    ui_info "Running intelligent auto-configuration for ${WEB_CONTAINER}..."
-    compute_allocation_for_tenant "${WEB_CONTAINER}"
-    apply_tenant_resource_tuning || ui_warn "Auto-tuning failed — retry with: sudo ./soviez.sh --formworkers ${WEB_CONTAINER}"
-  fi
-
-  show_progress "Provisioning application database (${DEFAULT_APP_DB_NAME})..." \
-    provision_application_database || {
-      ui_error "Application database provisioning failed — see ${LOG_FILE}"
-      exit 1
-    }
 
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
@@ -3115,24 +3149,15 @@ mode_rebuild() {
   docker_volume_rm_soft "${FILESTORE_VOLUME}"
 
   ensure_custom_addons_dir
+  load_env_file
   show_progress "Recreating network and volumes..." ensure_network_and_volumes
-  show_progress "Starting PostgreSQL (${DB_CONTAINER})..." ensure_postgres_container
-  show_progress "Launching Soviez ERP (${WEB_CONTAINER})..." launch_web_container
 
-  # Re-apply Docker cgroup limits if previously tuned
-  if [[ -n "${SOVIEZ_DOCKER_CPUS:-}" || -n "${SOVIEZ_DOCKER_MEM_MB:-}" ]]; then
-    docker update \
-      ${SOVIEZ_DOCKER_CPUS:+--cpus="${SOVIEZ_DOCKER_CPUS}"} \
-      ${SOVIEZ_DOCKER_MEM_MB:+--memory="${SOVIEZ_DOCKER_MEM_MB}m" --memory-swap="${SOVIEZ_DOCKER_MEM_MB}m"} \
-      "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  # Fresh stack + new app password; no retune/SSL (domain/Nginx kept).
+  FORCE_NEW_APP_PASSWORD=1
+  if ! run_tenant_core_pipeline 0 0; then
+    ui_error "Rebuild core pipeline failed — see ${LOG_FILE}"
+    exit 1
   fi
-
-  SOVIEZ_DB_NAME="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
-  show_progress "Provisioning fresh application database (${SOVIEZ_DB_NAME})..." \
-    provision_application_database || {
-      ui_error "Rebuild database provisioning failed — see ${LOG_FILE}"
-      exit 1
-    }
 
   print_green_success "Tenant ${tenant_name} rebuilt."
   print_tenant_login_banner "${domain:-localhost}"
@@ -3191,7 +3216,7 @@ mode_formsetup() {
     exit 1
   fi
 
-  local target_index
+  local target_index do_tune=0
   target_index="$(select_formsetup_index)"
   if (( target_index < 1 )); then
     ui_error "No tenant environment sheet found. Provision with: sudo ./soviez.sh --new"
@@ -3235,23 +3260,16 @@ mode_formsetup() {
 
   ui_info "Healing half-configured instance index=${INSTANCE_INDEX}"
   ensure_custom_addons_dir
-
   resume_network_and_volumes
-  if ! resume_postgres_container; then
-    ui_error "PostgreSQL recovery failed — see ${LOG_FILE} and: docker logs ${DB_CONTAINER}"
-    exit 1
-  fi
-  resume_web_container
 
-  ui_wait "Regenerating Nginx + HTTPS for ${TENANT_DOMAIN}..."
-  if ! provision_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"; then
-    ui_error "Nginx/SSL recovery failed — see ${LOG_FILE}"
+  # Honor original --new auto-tune choice when healing.
+  [[ "${SOVIEZ_AUTO_TUNE:-0}" == "1" ]] && do_tune=1
+
+  # Shared pipeline: DB (if missing) → web (if missing) → provision → tune → SSL
+  if ! run_tenant_core_pipeline "${do_tune}" 1; then
+    ui_error "Formsetup core pipeline failed — see ${LOG_FILE}"
     exit 1
   fi
-  persist_env_key "SOVIEZ_SSL_MODE" "${SSL_STATUS}"
-  persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
-  ui_ok "HTTPS pipeline complete for ${TENANT_DOMAIN} (${SSL_STATUS})"
-  verify_and_heal_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"
 
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
