@@ -869,6 +869,36 @@ wait_for_postgres() {
   return 1
 }
 
+# Detect the NUL-squash bug: CMD became "postgres-cshared_buffers=…" (single token).
+postgres_cmd_is_mangled() {
+  container_exists "${DB_CONTAINER}" || return 1
+  local cmd
+  cmd="$(docker inspect -f '{{join .Config.Cmd " "}}' "${DB_CONTAINER}" 2>/dev/null || true)"
+  [[ -z "${cmd}" ]] && return 1
+  if [[ "${cmd}" == *postgres-c* ]] \
+    || [[ "${cmd}" == *"-cshared_buffers"* ]] \
+    || [[ "${cmd}" == *"-ceffective_cache"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+postgres_engine_state() {
+  docker inspect -f '{{.State.Status}}' "${DB_CONTAINER}" 2>/dev/null || printf '%s\n' "missing"
+}
+
+# Soft-delete DB container only (named volume soviez_db_data_N is preserved).
+recycle_postgres_engine() {
+  local reason="${1:-unhealthy PostgreSQL engine}"
+  ui_warn "${reason} — recreating ${DB_CONTAINER} (data volume ${DB_VOLUME} preserved)..."
+  docker stop "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  docker rm -f "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  run_postgres_container || return 1
+  wait_for_postgres || return 1
+  ui_ok "PostgreSQL recreated (${DB_CONTAINER})"
+  return 0
+}
+
 # Intelligent Auto-Configuration & Resource Tuning Engine
 # ===========================================================================
 
@@ -1251,32 +1281,77 @@ prompt_resource_tuning_on_new() {
 }
 
 ensure_postgres_container() {
-  if container_running "${DB_CONTAINER}"; then
-    log_file "DB ${DB_CONTAINER} already running"
-  elif container_exists "${DB_CONTAINER}"; then
-    docker start "${DB_CONTAINER}" >/dev/null
-  else
-    run_postgres_container || return 1
+  if container_exists "${DB_CONTAINER}"; then
+    if postgres_cmd_is_mangled; then
+      recycle_postgres_engine "Broken PostgreSQL launch command on ${DB_CONTAINER}" || return 1
+      return 0
+    fi
+    local st
+    st="$(postgres_engine_state)"
+    case "${st}" in
+      restarting|dead|exited|created)
+        recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} state=${st}" || return 1
+        return 0
+        ;;
+    esac
+    if container_running "${DB_CONTAINER}"; then
+      log_file "DB ${DB_CONTAINER} already running"
+      if wait_for_postgres; then
+        return 0
+      fi
+      recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} is up but not accepting connections" || return 1
+      return 0
+    fi
+    docker start "${DB_CONTAINER}" >/dev/null 2>&1 || true
+    if wait_for_postgres; then
+      return 0
+    fi
+    recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} failed to become ready after start" || return 1
+    return 0
   fi
+  run_postgres_container || return 1
   wait_for_postgres
 }
 
 resume_postgres_container() {
-  if container_running "${DB_CONTAINER}"; then
-    ui_ok "PostgreSQL already running (${DB_CONTAINER})"
-    wait_for_postgres
+  if ! container_exists "${DB_CONTAINER}"; then
+    ui_wait "Creating PostgreSQL (${DB_CONTAINER})..."
+    ensure_postgres_container || return 1
+    ui_ok "PostgreSQL created (${DB_CONTAINER})"
     return 0
   fi
-  if container_exists "${DB_CONTAINER}"; then
-    ui_wait "Starting stopped PostgreSQL (${DB_CONTAINER})..."
-    docker start "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1
-    wait_for_postgres
+
+  if postgres_cmd_is_mangled; then
+    recycle_postgres_engine "Broken PostgreSQL launch command (mangled -c flags) on ${DB_CONTAINER}" || return 1
+    return 0
+  fi
+
+  local st
+  st="$(postgres_engine_state)"
+  case "${st}" in
+    restarting|dead|exited|created)
+      recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} state=${st}" || return 1
+      return 0
+      ;;
+  esac
+
+  if container_running "${DB_CONTAINER}"; then
+    ui_ok "PostgreSQL already running (${DB_CONTAINER})"
+    if wait_for_postgres; then
+      return 0
+    fi
+    # Typical after the Safe Restart argv bug: container "Up"/"Restarting" but pg_isready never succeeds.
+    recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} not accepting connections" || return 1
+    return 0
+  fi
+
+  ui_wait "Starting stopped PostgreSQL (${DB_CONTAINER})..."
+  docker start "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  if wait_for_postgres; then
     ui_ok "PostgreSQL started (${DB_CONTAINER})"
     return 0
   fi
-  ui_wait "Creating PostgreSQL (${DB_CONTAINER})..."
-  ensure_postgres_container
-  ui_ok "PostgreSQL created (${DB_CONTAINER})"
+  recycle_postgres_engine "PostgreSQL ${DB_CONTAINER} failed to become ready after start" || return 1
 }
 
 resume_web_container() {
@@ -3162,7 +3237,10 @@ mode_formsetup() {
   ensure_custom_addons_dir
 
   resume_network_and_volumes
-  resume_postgres_container
+  if ! resume_postgres_container; then
+    ui_error "PostgreSQL recovery failed — see ${LOG_FILE} and: docker logs ${DB_CONTAINER}"
+    exit 1
+  fi
   resume_web_container
 
   ui_wait "Regenerating Nginx + HTTPS for ${TENANT_DOMAIN}..."
