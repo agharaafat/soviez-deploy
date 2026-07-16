@@ -16,6 +16,7 @@
 #   ./soviez.sh --monitor              Live docker stats for running soviez-* containers
 #   ./soviez.sh --logs <tenant>        Stream docker logs for the tenant web container
 #   ./soviez.sh --update               Pull soviez/soviez-erp:latest and recycle web runners
+#   ./soviez.sh --formworkers <tenant>   Auto-tune Odoo workers, PG buffers, Docker limits
 #   ./soviez.sh --recoverdbpass        Rotate Database Master Password (primary / indexed via env)
 #
 # Logs: /var/log/soviez_setup.log (verbose); terminal shows clean status UI only.
@@ -32,6 +33,9 @@ readonly SOVIEZ_HOST_ROOT="/soviez"
 readonly CUSTOM_ADDONS_CONTAINER_PATH="/root/custom_addons"
 readonly BACKUP_ROOT="/var/soviez/backups"
 readonly BACKUP_SAFETY_MARGIN_BYTES=$((5 * 1024 * 1024 * 1024))
+readonly SOVIEZ_VOLUME_ROOT="/var/soviez/volumes"
+readonly RESOURCE_UTIL_WARN_PCT=80
+readonly RESOURCE_SYSTEM_REQUIREMENTS_URL="https://www.soviez.com/docs/system-requirements#size-production-server"
 LOG_FILE="/var/log/soviez_setup.log"
 readonly NGINX_LIMITS_CONF="/etc/nginx/conf.d/soviez_limits.conf"
 
@@ -65,6 +69,18 @@ RESET_USERNAME=""
 RESET_PASSWORD=""
 CHANGE_DOMAIN_TENANT_REF=""
 LOGS_TENANT_REF=""
+FORMWORKERS_TENANT_REF=""
+# Resource tuning outputs (set by compute_allocation_for_tenant)
+WORKERS=""
+LIMIT_SOFT_BYTES=""
+LIMIT_HARD_BYTES=""
+PG_SHARED_MB=""
+PG_EFFECTIVE_MB=""
+DOCKER_MEM_MB=""
+DOCKER_CPUS=""
+ALLOC_RAM_MB=""
+ALLOC_CORES=""
+AUTO_TUNE_ON_NEW=0
 readonly STAGE_DB_NAME="stage"
 readonly DB_APP_USER="soviez"
 
@@ -139,6 +155,9 @@ for arg in "$@"; do
     --recoverdbpass)
       MODE="recover"
       ;;
+    --formworkers)
+      MODE="formworkers"
+      ;;
     -h|--help)
       cat <<'USAGE'
 Soviez ERP — production onboarding wizard
@@ -159,6 +178,7 @@ Usage:
   ./soviez.sh --monitor                      Live docker stats for running soviez-* containers
   ./soviez.sh --logs <tenant>                Follow tenant web container logs
   ./soviez.sh --update                       Pull latest ERP image and recycle web containers
+  ./soviez.sh --formworkers <tenant>         Tune Odoo workers, PostgreSQL buffers, Docker limits
   ./soviez.sh --recoverdbpass                Rotate Database Master Password
   ./soviez.sh --help                         Show this help
 
@@ -175,6 +195,7 @@ Examples:
   sudo ./soviez.sh --change-domain 2
   sudo ./soviez.sh --monitor
   sudo ./soviez.sh --logs soviez-web-1
+  sudo ./soviez.sh --formworkers soviez-web-1
 
 Images:
   soviez/soviez-erp:latest
@@ -219,6 +240,8 @@ USAGE
         CHANGE_DOMAIN_TENANT_REF="${clean_arg}"
       elif [[ "${MODE}" == "logs" && -z "${LOGS_TENANT_REF}" ]]; then
         LOGS_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "formworkers" && -z "${FORMWORKERS_TENANT_REF}" ]]; then
+        FORMWORKERS_TENANT_REF="${clean_arg}"
       else
         echo "[ERROR] Unknown argument: ${arg}" >&2
         echo "[ERROR] Try: ./soviez.sh --help" >&2
@@ -773,22 +796,389 @@ wait_for_postgres() {
   return 1
 }
 
+# Intelligent Auto-Configuration & Resource Tuning Engine
+# ===========================================================================
+
+host_total_ram_mb() {
+  awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null \
+    || free -m | awk '/^Mem:/ { print $2 }'
+}
+
+host_total_cpu_cores() {
+  nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2
+}
+
+tenant_odoo_conf_path() {
+  printf '%s/%s/conf/odoo.conf\n' "${SOVIEZ_VOLUME_ROOT}" "${WEB_CONTAINER}"
+}
+
+tenant_runtime_conf_dir() {
+  printf '%s/%s/conf\n' "${SOVIEZ_VOLUME_ROOT}" "${WEB_CONTAINER}"
+}
+
+conf_get_option() {
+  local file="$1" key="$2"
+  [[ -f "${file}" ]] || return 1
+  awk -v k="${key}" '
+    $1 == k && ($2 == "=" || $3 == "=") {
+      sub(/^[^=]+=[[:space:]]*/, "")
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      print
+      exit
+    }
+  ' "${file}"
+}
+
+conf_set_option() {
+  local file="$1" key="$2" value="$3"
+  local tmp
+  mkdir -p "$(dirname "${file}")"
+  touch "${file}"
+  tmp="$(mktemp)"
+  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    sed -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}" > "${tmp}"
+  else
+    cp "${file}" "${tmp}"
+    printf '\n%s = %s\n' "${key}" "${value}" >> "${tmp}"
+  fi
+  mv "${tmp}" "${file}"
+  chmod 640 "${file}" 2>/dev/null || true
+}
+
+ensure_tenant_odoo_conf() {
+  local conf_path dir
+  conf_path="$(tenant_odoo_conf_path)"
+  dir="$(dirname "${conf_path}")"
+  mkdir -p "${dir}"
+  chmod 755 "${SOVIEZ_VOLUME_ROOT}" "${SOVIEZ_VOLUME_ROOT}/${WEB_CONTAINER}" "${dir}" 2>/dev/null || true
+
+  if [[ ! -f "${conf_path}" ]]; then
+    cat > "${conf_path}" <<EOF
+[options]
+; Per-tenant runtime — managed by soviez.sh (--new auto-config / --formworkers)
+workers = 0
+limit_memory_soft = 2147483648
+limit_memory_hard = 2684354560
+addons_path = /opt/soviez-erp/addons,/opt/soviez-erp/odoo/addons
+data_dir = /root/.local/share/Odoo
+list_db = False
+EOF
+    chmod 640 "${conf_path}"
+    log_file "Created tenant runtime odoo.conf at ${conf_path}"
+  fi
+}
+
+# Enumerate tenant env sheets (deduplicated by realpath).
+collect_tenant_env_paths() {
+  local -a paths=() seen=() real path
+  shopt -s nullglob
+  for path in \
+      "${INSTANCE_ROOT}"/.soviez_*.env \
+      "${INSTANCE_ROOT}"/.soviez.env \
+      "$(pwd)"/.soviez_*.env \
+      "$(pwd)"/.soviez.env; do
+    [[ -f "${path}" ]] || continue
+    real="$(readlink -f "${path}" 2>/dev/null || echo "${path}")"
+    local dup=0 prev
+    for prev in "${seen[@]:-}"; do
+      [[ "${prev}" == "${real}" ]] && dup=1 && break
+    done
+    (( dup == 1 )) && continue
+    seen+=("${real}")
+    paths+=("${path}")
+  done
+  shopt -u nullglob
+  printf '%s\n' "${paths[@]}"
+}
+
+# Sum reserved RAM (MB) and CPU cores from env sheets + odoo.conf files.
+# Optional $1 = WEB_CONTAINER name to exclude (when allocating for that tenant).
+scan_reserved_resources() {
+  local exclude_web="${1:-}"
+  local path web db workers soft hard ram_mb cpu_cores pg_mb
+  local total_ram_mb=0 total_cpu=0
+
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    web="$(grep -E '^SOVIEZ_WEB_CONTAINER=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    [[ -n "${web}" ]] || continue
+    [[ -n "${exclude_web}" && "${web}" == "${exclude_web}" ]] && continue
+
+    ram_mb="$(grep -E '^SOVIEZ_ALLOC_RAM_MB=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    cpu_cores="$(grep -E '^SOVIEZ_ALLOC_CORES=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    pg_mb="$(grep -E '^SOVIEZ_PG_SHARED_BUFFERS_MB=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+
+    if [[ -z "${ram_mb}" || ! "${ram_mb}" =~ ^[0-9]+$ ]]; then
+      workers="$(conf_get_option "${SOVIEZ_VOLUME_ROOT}/${web}/conf/odoo.conf" workers || true)"
+      hard="$(conf_get_option "${SOVIEZ_VOLUME_ROOT}/${web}/conf/odoo.conf" limit_memory_hard || true)"
+      if [[ -n "${workers}" && "${workers}" =~ ^[0-9]+$ && "${workers}" -gt 0 ]]; then
+        ram_mb=$(( workers * 800 ))
+      elif [[ -n "${hard}" && "${hard}" =~ ^[0-9]+$ ]]; then
+        ram_mb=$(( hard / 1024 / 1024 ))
+      else
+        ram_mb=4096
+      fi
+      [[ -n "${pg_mb}" && "${pg_mb}" =~ ^[0-9]+$ ]] && ram_mb=$(( ram_mb + pg_mb ))
+    fi
+
+    if [[ -z "${cpu_cores}" || ! "${cpu_cores}" =~ ^[0-9]+$ ]]; then
+      cpu_cores="$(grep -E '^SOVIEZ_DOCKER_CPUS=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+      if [[ -z "${cpu_cores}" || ! "${cpu_cores}" =~ ^[0-9]+$ ]]; then
+        workers="$(conf_get_option "${SOVIEZ_VOLUME_ROOT}/${web}/conf/odoo.conf" workers || true)"
+        if [[ -n "${workers}" && "${workers}" =~ ^[0-9]+$ && "${workers}" -gt 0 ]]; then
+          cpu_cores=$(( (workers - 1) / 2 ))
+          (( cpu_cores < 1 )) && cpu_cores=1
+        else
+          cpu_cores=1
+        fi
+      fi
+    fi
+
+    total_ram_mb=$(( total_ram_mb + ram_mb ))
+    total_cpu=$(( total_cpu + cpu_cores ))
+  done < <(collect_tenant_env_paths)
+
+  printf '%s %s\n' "${total_ram_mb}" "${total_cpu}"
+}
+
+host_resource_utilization_percent() {
+  local total_ram total_cpu reserved reserved_ram reserved_cpu ram_pct cpu_pct
+  total_ram="$(host_total_ram_mb)"
+  total_cpu="$(host_total_cpu_cores)"
+  read -r reserved_ram reserved_cpu < <(scan_reserved_resources "")
+  (( total_ram < 1 )) && total_ram=4096
+  (( total_cpu < 1 )) && total_cpu=2
+  ram_pct=$(( reserved_ram * 100 / total_ram ))
+  cpu_pct=$(( reserved_cpu * 100 / total_cpu ))
+  if (( ram_pct > cpu_pct )); then
+    echo "${ram_pct}"
+  else
+    echo "${cpu_pct}"
+  fi
+}
+
+prompt_yes_no() {
+  local question="$1" answer
+  while true; do
+    read -r -p "${question} (y/n): " answer
+    case "${answer}" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO) return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+print_resource_pressure_warning() {
+  local utilization="$1"
+  echo ""
+  echo -e "${C_RED}${C_BOLD}╔══════════════════════════════════════════════════════════════════════╗${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}║  WARNING — HOST RESOURCES ${utilization}% UTILIZED (THRESHOLD ${RESOURCE_UTIL_WARN_PCT}%)${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}╠══════════════════════════════════════════════════════════════════════╣${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}║${C_RESET}  Existing tenants already reserve most CPU/RAM on this node."
+  echo -e "${C_RED}${C_BOLD}║${C_RESET}  Provision a larger server or add a new node before stacking tenants."
+  echo -e "${C_RED}${C_BOLD}║${C_RESET}  Sizing guide: ${RESOURCE_SYSTEM_REQUIREMENTS_URL}"
+  echo -e "${C_RED}${C_BOLD}╚══════════════════════════════════════════════════════════════════════╝${C_RESET}"
+  echo ""
+}
+
+# Compute allocation for the active WEB_CONTAINER topology (excludes self when re-tuning).
+compute_allocation_for_tenant() {
+  local exclude_web="${1:-${WEB_CONTAINER}}"
+  local total_ram total_cpu reserved_ram reserved_cpu
+  local usable_ram usable_cpu tenant_slots
+
+  total_ram="$(host_total_ram_mb)"
+  total_cpu="$(host_total_cpu_cores)"
+  read -r reserved_ram reserved_cpu < <(scan_reserved_resources "${exclude_web}")
+
+  # Reserve ~15% for kernel, Docker daemon, Nginx, and headroom.
+  usable_ram=$(( total_ram * 85 / 100 - reserved_ram ))
+  usable_cpu=$(( total_cpu - reserved_cpu ))
+
+  (( usable_ram < 2048 )) && usable_ram=2048
+  (( usable_cpu < 1 )) && usable_cpu=1
+
+  tenant_slots="$(collect_tenant_env_paths | wc -l | tr -d ' ')"
+  if [[ -n "${exclude_web}" ]] && container_exists "${exclude_web}"; then
+    : # re-tuning existing tenant — grant full remaining slice
+  else
+    tenant_slots=$(( tenant_slots + 1 ))
+  fi
+  (( tenant_slots < 1 )) && tenant_slots=1
+
+  ALLOC_RAM_MB=$(( usable_ram / tenant_slots ))
+  ALLOC_CORES=$(( usable_cpu / tenant_slots ))
+  (( ALLOC_RAM_MB < 2048 )) && ALLOC_RAM_MB=2048
+  (( ALLOC_CORES < 1 )) && ALLOC_CORES=1
+  (( ALLOC_CORES > usable_cpu )) && ALLOC_CORES="${usable_cpu}"
+
+  WORKERS=$(( ALLOC_CORES * 2 + 1 ))
+  LIMIT_SOFT_BYTES=$(( WORKERS * 600 * 1024 * 1024 ))
+  LIMIT_HARD_BYTES=$(( WORKERS * 800 * 1024 * 1024 ))
+  PG_SHARED_MB=$(( ALLOC_RAM_MB * 25 / 100 ))
+  PG_EFFECTIVE_MB=$(( ALLOC_RAM_MB * 75 / 100 ))
+  (( PG_SHARED_MB < 128 )) && PG_SHARED_MB=128
+  DOCKER_MEM_MB=$(( LIMIT_HARD_BYTES / 1024 / 1024 + PG_SHARED_MB + 512 ))
+  DOCKER_CPUS="${ALLOC_CORES}"
+
+  log_file "ALLOC tenant=${WEB_CONTAINER} ram_mb=${ALLOC_RAM_MB} cores=${ALLOC_CORES} workers=${WORKERS} pg_shared=${PG_SHARED_MB}MB docker_mem=${DOCKER_MEM_MB}MB"
+}
+
+persist_resource_tuning_env() {
+  persist_env_key "SOVIEZ_WORKERS" "${WORKERS}"
+  persist_env_key "SOVIEZ_LIMIT_MEMORY_SOFT" "${LIMIT_SOFT_BYTES}"
+  persist_env_key "SOVIEZ_LIMIT_MEMORY_HARD" "${LIMIT_HARD_BYTES}"
+  persist_env_key "SOVIEZ_PG_SHARED_BUFFERS_MB" "${PG_SHARED_MB}"
+  persist_env_key "SOVIEZ_PG_EFFECTIVE_CACHE_MB" "${PG_EFFECTIVE_MB}"
+  persist_env_key "SOVIEZ_DOCKER_MEM_MB" "${DOCKER_MEM_MB}"
+  persist_env_key "SOVIEZ_DOCKER_CPUS" "${DOCKER_CPUS}"
+  persist_env_key "SOVIEZ_ALLOC_RAM_MB" "${ALLOC_RAM_MB}"
+  persist_env_key "SOVIEZ_ALLOC_CORES" "${ALLOC_CORES}"
+  load_env_file
+}
+
+postgres_tuning_run_args() {
+  local -a args=()
+  if [[ -n "${SOVIEZ_PG_SHARED_BUFFERS_MB:-${PG_SHARED_MB}}" ]]; then
+    args+=(postgres -c "shared_buffers=${SOVIEZ_PG_SHARED_BUFFERS_MB:-${PG_SHARED_MB}}MB")
+    args+=(-c "effective_cache_size=${SOVIEZ_PG_EFFECTIVE_CACHE_MB:-${PG_EFFECTIVE_MB}}MB")
+    args+=(-c "maintenance_work_mem=64MB")
+    args+=(-c "work_mem=16MB")
+  fi
+  printf '%s\0' "${args[@]}"
+}
+
+recreate_postgres_with_tuning() {
+  local -a pg_cmd=()
+  local blob
+  blob="$(postgres_tuning_run_args)"
+  if [[ -n "${blob}" ]]; then
+    IFS=$'\0' read -r -a pg_cmd <<< "${blob}"
+  fi
+
+  ui_wait "Recreating ${DB_CONTAINER} on volume ${DB_VOLUME} with tuned PostgreSQL buffers..."
+  docker run -d \
+    --name "${DB_CONTAINER}" \
+    --restart unless-stopped \
+    --network "${NETWORK_NAME}" \
+    -e POSTGRES_DB=postgres \
+    -e POSTGRES_USER=soviez \
+    -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -v "${DB_VOLUME}:/var/lib/postgresql/data" \
+    "${DB_IMAGE}" \
+    "${pg_cmd[@]}" >>"${LOG_FILE}" 2>&1
+
+  wait_for_postgres
+  ui_ok "PostgreSQL ${DB_CONTAINER} online with tuned buffers"
+}
+
+apply_tenant_resource_tuning() {
+  ensure_tenant_odoo_conf
+  local conf_path
+  conf_path="$(tenant_odoo_conf_path)"
+
+  persist_resource_tuning_env
+
+  if ! container_exists "${WEB_CONTAINER}"; then
+    ui_error "Web container ${WEB_CONTAINER} does not exist — provision the tenant first."
+    return 1
+  fi
+
+  ui_info "Applying tuning to ${WEB_CONTAINER}: workers=${WORKERS}, cores=${DOCKER_CPUS}, ram=${DOCKER_MEM_MB}MB"
+
+  ui_wait "Stopping ${WEB_CONTAINER} (flush in-flight transactions)..."
+  docker stop "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+
+  if container_exists "${DB_CONTAINER}"; then
+    ui_wait "Stopping ${DB_CONTAINER}..."
+    docker stop "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+    docker rm "${DB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  fi
+
+  recreate_postgres_with_tuning
+
+  conf_set_option "${conf_path}" workers "${WORKERS}"
+  conf_set_option "${conf_path}" limit_memory_soft "${LIMIT_SOFT_BYTES}"
+  conf_set_option "${conf_path}" limit_memory_hard "${LIMIT_HARD_BYTES}"
+
+  ui_wait "Applying Docker cgroup limits on ${WEB_CONTAINER}..."
+  docker update \
+    --cpus="${DOCKER_CPUS}" \
+    --memory="${DOCKER_MEM_MB}m" \
+    --memory-swap="${DOCKER_MEM_MB}m" \
+    "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1
+
+  ui_wait "Starting ${WEB_CONTAINER} with updated odoo.conf..."
+  docker start "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1
+
+  ui_ok "Resource tuning complete for ${WEB_CONTAINER}"
+  echo -e "  ${C_DIM}Config:${C_RESET} ${conf_path}"
+  echo -e "  ${C_DIM}Workers:${C_RESET} ${WORKERS}  ${C_DIM}Soft/Hard:${C_RESET} $(( LIMIT_SOFT_BYTES / 1024 / 1024 ))MB / $(( LIMIT_HARD_BYTES / 1024 / 1024 ))MB"
+  echo -e "  ${C_DIM}PostgreSQL:${C_RESET} shared_buffers=${PG_SHARED_MB}MB  effective_cache_size=${PG_EFFECTIVE_MB}MB"
+}
+
+prompt_resource_tuning_on_new() {
+  local utilization
+  utilization="$(host_resource_utilization_percent)"
+  ui_info "Host resource scan: ~${utilization}% utilized (RAM/CPU reservation model)"
+
+  if (( utilization > RESOURCE_UTIL_WARN_PCT )); then
+    print_resource_pressure_warning "${utilization}"
+    if prompt_yes_no "Continue creating this tenant WITHOUT auto-configuration"; then
+      AUTO_TUNE_ON_NEW=0
+    else
+      ui_error "Tenant provisioning aborted — upgrade hardware or add a node, then retry."
+      exit 1
+    fi
+    return 0
+  fi
+
+  if prompt_yes_no "Auto-configure Odoo workers and PostgreSQL buffers for optimal performance"; then
+    AUTO_TUNE_ON_NEW=1
+    ui_info "Auto-tuning will run after containers launch (adjust later with --formworkers)."
+  else
+    AUTO_TUNE_ON_NEW=0
+    ui_info "Skipped auto-tuning — run sudo ./soviez.sh --formworkers ${WEB_CONTAINER} later."
+  fi
+}
+
 ensure_postgres_container() {
   if container_running "${DB_CONTAINER}"; then
     log_file "DB ${DB_CONTAINER} already running"
   elif container_exists "${DB_CONTAINER}"; then
     docker start "${DB_CONTAINER}" >/dev/null
   else
-    docker run -d \
-      --name "${DB_CONTAINER}" \
-      --restart unless-stopped \
-      --network "${NETWORK_NAME}" \
-      -e POSTGRES_DB=postgres \
-      -e POSTGRES_USER=soviez \
-      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      -v "${DB_VOLUME}:/var/lib/postgresql/data" \
-      "${DB_IMAGE}" >/dev/null
+    local -a pg_cmd=() blob
+    blob="$(postgres_tuning_run_args)"
+    if [[ -n "${blob}" ]]; then
+      IFS=$'\0' read -r -a pg_cmd <<< "${blob}"
+    fi
+    if ((${#pg_cmd[@]} > 0)); then
+      docker run -d \
+        --name "${DB_CONTAINER}" \
+        --restart unless-stopped \
+        --network "${NETWORK_NAME}" \
+        -e POSTGRES_DB=postgres \
+        -e POSTGRES_USER=soviez \
+        -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+        -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+        -v "${DB_VOLUME}:/var/lib/postgresql/data" \
+        "${DB_IMAGE}" \
+        "${pg_cmd[@]}" >/dev/null
+    else
+      docker run -d \
+        --name "${DB_CONTAINER}" \
+        --restart unless-stopped \
+        --network "${NETWORK_NAME}" \
+        -e POSTGRES_DB=postgres \
+        -e POSTGRES_USER=soviez \
+        -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+        -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+        -v "${DB_VOLUME}:/var/lib/postgresql/data" \
+        "${DB_IMAGE}" >/dev/null
+    fi
   fi
   wait_for_postgres
 }
@@ -893,15 +1283,18 @@ EOF
 }
 
 launch_web_container() {
-  local addons_cli
-  local -a volume_args=()
+  local addons_cli runtime_conf
+  local -a volume_args=() docker_limits=()
 
   ensure_host_ledger_dir
   ensure_custom_addons_dir
+  ensure_tenant_odoo_conf
+  runtime_conf="$(tenant_odoo_conf_path)"
 
   volume_args+=(
     -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
     -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
+    -v "${runtime_conf}:/opt/soviez-erp/tenant.odoo.conf:ro"
   )
 
   addons_cli="/opt/soviez-erp/addons,/opt/soviez-erp/odoo/addons"
@@ -910,6 +1303,13 @@ launch_web_container() {
       -v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}"
     )
     addons_cli="${addons_cli},${CUSTOM_ADDONS_CONTAINER_PATH}"
+  fi
+
+  if [[ -n "${SOVIEZ_DOCKER_CPUS:-}" ]]; then
+    docker_limits+=(--cpus="${SOVIEZ_DOCKER_CPUS}")
+  fi
+  if [[ -n "${SOVIEZ_DOCKER_MEM_MB:-}" ]]; then
+    docker_limits+=(--memory="${SOVIEZ_DOCKER_MEM_MB}m" --memory-swap="${SOVIEZ_DOCKER_MEM_MB}m")
   fi
 
   docker run -d \
@@ -921,9 +1321,10 @@ launch_web_container() {
     -e POSTGRES_USER=soviez \
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    "${docker_limits[@]}" \
     "${volume_args[@]}" \
     "${APP_IMAGE}" \
-    python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+    python3 soviez-bin -c /opt/soviez-erp/tenant.odoo.conf \
       --addons-path="${addons_cli}" \
       --db_host="${DB_CONTAINER}" \
       --db_port=5432 \
@@ -933,6 +1334,7 @@ launch_web_container() {
       --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" >/dev/null
 }
 
+# ===========================================================================
 list_odoo_databases() {
   if [[ -n "${SOVIEZ_DB_NAME:-}" ]]; then
     printf '%s\n' "${SOVIEZ_DB_NAME}"
@@ -1933,6 +2335,7 @@ mode_new() {
   fi
 
   ui_info "Provisioning isolated tenant index=${next_index} (${WEB_CONTAINER})"
+  prompt_resource_tuning_on_new
   ensure_custom_addons_dir
 
   SOVIEZ_CONTAINER_MAC="$(generate_mac)"
@@ -1955,6 +2358,7 @@ SOVIEZ_CUSTOM_ADDONS_HOST=${CUSTOM_ADDONS_HOST_PATH}
 SOVIEZ_CUSTOM_ADDONS_MOUNT=${CUSTOM_ADDONS_CONTAINER_PATH}
 SOVIEZ_TENANT_DOMAIN=${TENANT_DOMAIN}
 SOVIEZ_PUBLIC_IP=${public_ip}
+SOVIEZ_AUTO_TUNE=${AUTO_TUNE_ON_NEW}
 EOF
   chmod 600 "${ENV_FILE}"
 
@@ -1977,11 +2381,52 @@ EOF
   persist_env_key "SOVIEZ_PUBLIC_IP" "${PUBLIC_IP}"
   verify_and_heal_tenant_https "${TENANT_DOMAIN}" "${SOVIEZ_HOST_PORT}"
 
+  if (( AUTO_TUNE_ON_NEW == 1 )); then
+    ui_info "Running intelligent auto-configuration for ${WEB_CONTAINER}..."
+    compute_allocation_for_tenant "${WEB_CONTAINER}"
+    apply_tenant_resource_tuning || ui_warn "Auto-tuning failed — retry with: sudo ./soviez.sh --formworkers ${WEB_CONTAINER}"
+  fi
+
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
     "${CUSTOM_ADDONS_HOST_PATH}" \
     "${SOVIEZ_ADMIN_PASSWORD}" \
     "${next_index}"
+}
+
+# ===========================================================================
+# MODE: formworkers — intelligent resource tuning for an existing tenant
+# ===========================================================================
+mode_formworkers() {
+  require_root --formworkers
+  ensure_log_file
+  require_cmd docker
+
+  if [[ -z "${FORMWORKERS_TENANT_REF}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --formworkers <tenant>"
+    ui_error "Example: sudo ./soviez.sh --formworkers soviez-web-1"
+    exit 1
+  fi
+
+  load_tenant_topology_from_ref "${FORMWORKERS_TENANT_REF}"
+  resolve_custom_addons_host_path
+  require_complete_env
+
+  if ! container_exists "${WEB_CONTAINER}"; then
+    ui_error "Tenant web container not found: ${WEB_CONTAINER}"
+    ui_error "Provision the tenant first with: sudo ./soviez.sh --new"
+    exit 1
+  fi
+
+  print_border_box "Soviez ERP — Intelligent Resource Tuning" \
+    "Tenant: ${C_BOLD}${WEB_CONTAINER}${C_RESET}" \
+    "Env: ${ENV_FILE}" \
+    "" \
+    "Safe restart pipeline: stop web → recycle DB engine (volume kept) →" \
+    "update odoo.conf → apply Docker limits → start web."
+
+  compute_allocation_for_tenant "${WEB_CONTAINER}"
+  apply_tenant_resource_tuning
 }
 
 # ===========================================================================
@@ -3442,6 +3887,9 @@ case "${MODE}" in
     ;;
   recover)
     mode_recover
+    ;;
+  formworkers)
+    mode_formworkers
     ;;
   *)
     ui_error "Unknown mode: ${MODE}"
