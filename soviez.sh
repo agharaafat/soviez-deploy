@@ -17,7 +17,9 @@
 #   ./soviez.sh --logs <tenant>        Stream docker logs for the tenant web container
 #   ./soviez.sh --update               Pull soviez/soviez-erp:latest and recycle web runners
 #   ./soviez.sh --formworkers <tenant>   Auto-tune Odoo workers, PG buffers, Docker limits
-#   ./soviez.sh --recoverdbpass        Rotate Database Master Password (primary / indexed via env)
+#   ./soviez.sh --purge <tenant>         Irreversibly destroy a tenant (containers, volumes, configs)
+#   ./soviez.sh --rebuild <tenant>       Wipe DB + filestore; keep domain, env, and custom addons
+#   ./soviez.sh --recoverdbpass        Rotate internal admin_passwd (stored in env sheet)
 #
 # Logs: /var/log/soviez_setup.log (verbose); terminal shows clean status UI only.
 set -euo pipefail
@@ -36,6 +38,13 @@ readonly BACKUP_SAFETY_MARGIN_BYTES=$((5 * 1024 * 1024 * 1024))
 readonly SOVIEZ_VOLUME_ROOT="/var/soviez/volumes"
 readonly RESOURCE_UTIL_WARN_PCT=80
 readonly RESOURCE_SYSTEM_REQUIREMENTS_URL="https://www.soviez.com/docs/system-requirements#size-production-server"
+readonly DEFAULT_APP_DB_NAME="production"
+readonly DEFAULT_APP_LOGIN="admin"
+readonly APP_PASSWORD_LEN=12
+readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+readonly DOCKER_PRUNE_CRON="/etc/cron.weekly/soviez-docker-prune"
+readonly FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
+readonly CERTBOT_NGINX_RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/post/nginx-reload.sh"
 LOG_FILE="/var/log/soviez_setup.log"
 readonly NGINX_LIMITS_CONF="/etc/nginx/conf.d/soviez_limits.conf"
 
@@ -70,6 +79,8 @@ RESET_PASSWORD=""
 CHANGE_DOMAIN_TENANT_REF=""
 LOGS_TENANT_REF=""
 FORMWORKERS_TENANT_REF=""
+PURGE_TENANT_REF=""
+REBUILD_TENANT_REF=""
 # Resource tuning outputs (set by compute_allocation_for_tenant)
 WORKERS=""
 LIMIT_SOFT_BYTES=""
@@ -158,6 +169,12 @@ for arg in "$@"; do
     --formworkers)
       MODE="formworkers"
       ;;
+    --purge)
+      MODE="purge"
+      ;;
+    --rebuild)
+      MODE="rebuild"
+      ;;
     -h|--help)
       cat <<'USAGE'
 Soviez ERP — production onboarding wizard
@@ -179,7 +196,9 @@ Usage:
   ./soviez.sh --logs <tenant>                Follow tenant web container logs
   ./soviez.sh --update                       Pull latest ERP image and recycle web containers
   ./soviez.sh --formworkers <tenant>         Tune Odoo workers, PostgreSQL buffers, Docker limits
-  ./soviez.sh --recoverdbpass                Rotate Database Master Password
+  ./soviez.sh --purge <tenant>               Irreversibly destroy tenant (containers, volumes, configs)
+  ./soviez.sh --rebuild <tenant>             Wipe DB + filestore; keep domain, env, custom addons
+  ./soviez.sh --recoverdbpass                Rotate internal admin_passwd (env sheet)
   ./soviez.sh --help                         Show this help
 
 Tenant refs:
@@ -196,6 +215,8 @@ Examples:
   sudo ./soviez.sh --monitor
   sudo ./soviez.sh --logs soviez-web-1
   sudo ./soviez.sh --formworkers soviez-web-1
+  sudo ./soviez.sh --rebuild soviez-web-1
+  sudo ./soviez.sh --purge soviez-web-1
 
 Images:
   soviez/soviez-erp:latest
@@ -242,6 +263,10 @@ USAGE
         LOGS_TENANT_REF="${clean_arg}"
       elif [[ "${MODE}" == "formworkers" && -z "${FORMWORKERS_TENANT_REF}" ]]; then
         FORMWORKERS_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "purge" && -z "${PURGE_TENANT_REF}" ]]; then
+        PURGE_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "rebuild" && -z "${REBUILD_TENANT_REF}" ]]; then
+        REBUILD_TENANT_REF="${clean_arg}"
       else
         echo "[ERROR] Unknown argument: ${arg}" >&2
         echo "[ERROR] Try: ./soviez.sh --help" >&2
@@ -417,19 +442,6 @@ print_green_success() {
   echo ""
 }
 
-print_master_password_alert() {
-  local password="$1"
-  local headline="${2:-DATABASE MASTER PASSWORD}"
-  echo ""
-  echo -e "${C_RED}${C_BOLD}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo -e "${C_RED}${C_BOLD}!!  ${headline}${C_RESET}"
-  echo -e "${C_RED}${C_BOLD}!!  ${password}${C_RESET}"
-  echo -e "${C_RED}${C_BOLD}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${C_RESET}"
-  echo -e "${C_RED}Copy and vault this password now. Required for the Web Database Manager.${C_RESET}"
-  echo -e "${C_DIM}Recover later: sudo ./soviez.sh --recoverdbpass${C_RESET}"
-  echo ""
-}
-
 # ---------------------------------------------------------------------------
 # Paths / topology
 # ---------------------------------------------------------------------------
@@ -523,6 +535,16 @@ import secrets
 import string
 alphabet = string.ascii_letters + string.digits
 print("".join(secrets.choice(alphabet) for _ in range(32)))
+PY
+}
+
+# 12-character alphanumeric ERP login password (Day-1 admin user).
+generate_app_password() {
+  python3 - <<PY
+import secrets
+import string
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(${APP_PASSWORD_LEN})))
 PY
 }
 
@@ -1478,6 +1500,200 @@ require_complete_env() {
 }
 
 # ---------------------------------------------------------------------------
+# Application database bootstrap (auto-provision for --new / --rebuild)
+# ---------------------------------------------------------------------------
+
+addons_cli_for_runtime() {
+  local addons_cli="/opt/soviez-erp/addons,/opt/soviez-erp/odoo/addons"
+  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
+    addons_cli="${addons_cli},${CUSTOM_ADDONS_CONTAINER_PATH}"
+  fi
+  printf '%s\n' "${addons_cli}"
+}
+
+# Write Odoo login password via shell (correct hashing — never raw SQL).
+set_odoo_user_password() {
+  local dbname="$1"
+  local login="$2"
+  local passwd="$3"
+  local py_script rc=0 login_b64 pass_b64
+  local addons_cli
+  local -a volume_args=(
+    -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
+    -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
+  )
+
+  assert_safe_dbname "${dbname}"
+  ensure_host_ledger_dir
+  addons_cli="$(addons_cli_for_runtime)"
+  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
+    volume_args+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
+  fi
+
+  login_b64="$(printf '%s' "${login}" | base64 | tr -d '\n')"
+  pass_b64="$(printf '%s' "${passwd}" | base64 | tr -d '\n')"
+  py_script="$(cat <<'PY'
+import base64
+import os
+login = base64.b64decode(os.environ.get("SOVIEZ_RESET_LOGIN_B64", "")).decode("utf-8")
+passwd = base64.b64decode(os.environ.get("SOVIEZ_RESET_PASS_B64", "")).decode("utf-8")
+if not login or not passwd:
+    raise SystemExit("Missing login/password payload")
+user = env["res.users"].search([("login", "=", login)], limit=1)
+if not user:
+    raise SystemExit(f"User not found: {login}")
+user.write({"password": passwd})
+env.cr.commit()
+print(f"OK password updated for login={login} uid={user.id}")
+PY
+)"
+
+  set +e
+  printf '%s\n' "${py_script}" | docker run --rm -i \
+      --network "${NETWORK_NAME}" \
+      -e "SOVIEZ_RESET_LOGIN_B64=${login_b64}" \
+      -e "SOVIEZ_RESET_PASS_B64=${pass_b64}" \
+      -e POSTGRES_USER=soviez \
+      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      "${volume_args[@]}" \
+      "${APP_IMAGE}" \
+      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+        --addons-path="${addons_cli}" \
+        --db_host="${DB_CONTAINER}" \
+        --db_port=5432 \
+        --db_user=soviez \
+        --db_password="${SOVIEZ_DB_PASSWORD}" \
+        --data-dir=/root/.local/share/Odoo \
+        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
+        -d "${dbname}" --stop-after-init shell >>"${LOG_FILE}" 2>&1
+  rc=$?
+  set -e
+  return "${rc}"
+}
+
+# Create (or refresh) the application DB, install core modules, set a random admin password.
+provision_application_database() {
+  local dbname="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
+  local addons_cli
+  local -a volume_args=(
+    -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
+    -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
+  )
+  local install_rc=0
+  local app_password=""
+
+  assert_safe_dbname "${dbname}"
+  ensure_host_ledger_dir
+  wait_for_postgres || return 1
+
+  # Always mint a fresh ERP login password on provision / rebuild.
+  app_password="$(generate_app_password)"
+  SOVIEZ_APP_PASSWORD="${app_password}"
+
+  addons_cli="$(addons_cli_for_runtime)"
+  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
+    volume_args+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
+  fi
+
+  if pg_database_exists "${dbname}"; then
+    ui_info "Application database '${dbname}' already present — rotating admin credentials"
+  else
+    ui_wait "Creating application database '${dbname}' and installing core modules..."
+    set +e
+    docker run --rm \
+      --network "${NETWORK_NAME}" \
+      --mac-address "${SOVIEZ_CONTAINER_MAC}" \
+      -e POSTGRES_USER=soviez \
+      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      "${volume_args[@]}" \
+      "${APP_IMAGE}" \
+      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+        --addons-path="${addons_cli}" \
+        --db_host="${DB_CONTAINER}" \
+        --db_port=5432 \
+        --db_user=soviez \
+        --db_password="${SOVIEZ_DB_PASSWORD}" \
+        --data-dir=/root/.local/share/Odoo \
+        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
+        -d "${dbname}" \
+        -i "${UPGRADE_MODULES}" \
+        --without-demo=all \
+        --stop-after-init >>"${LOG_FILE}" 2>&1
+    install_rc=$?
+    set -e
+    if (( install_rc != 0 )); then
+      ui_error "Database provisioning failed for '${dbname}' (exit ${install_rc}) — see ${LOG_FILE}"
+      return "${install_rc}"
+    fi
+    ui_ok "Database '${dbname}' created with core modules"
+  fi
+
+  ui_wait "Setting secure login for ${DEFAULT_APP_LOGIN}..."
+  if ! set_odoo_user_password "${dbname}" "${DEFAULT_APP_LOGIN}" "${app_password}"; then
+    ui_error "Failed to set admin password — see ${LOG_FILE}"
+    return 1
+  fi
+  ui_ok "Admin credentials ready (${DEFAULT_APP_LOGIN} / random ${APP_PASSWORD_LEN}-char password)"
+
+  persist_env_key "SOVIEZ_DB_NAME" "${dbname}"
+  persist_env_key "SOVIEZ_APP_PASSWORD" "${app_password}"
+  SOVIEZ_DB_NAME="${dbname}"
+  return 0
+}
+
+print_tenant_login_banner() {
+  local domain="$1"
+  local password="${2:-${SOVIEZ_APP_PASSWORD:-}}"
+  echo ""
+  echo -e "${C_GREEN}${C_BOLD}==============================================================${C_RESET}"
+  echo -e "${C_GREEN}${C_BOLD}🎉 Tenant provisioned successfully!${C_RESET}"
+  echo -e "${C_GREEN}${C_BOLD}==============================================================${C_RESET}"
+  echo -e "  ${C_BOLD}🔗 Login URL:${C_RESET}  ${C_CYAN}https://${domain}${C_RESET}"
+  echo -e "  ${C_BOLD}👤 Username:${C_RESET}   ${C_CYAN}${DEFAULT_APP_LOGIN}${C_RESET}"
+  if [[ -n "${password}" ]]; then
+    echo -e "  ${C_BOLD}🔑 Password:${C_RESET}   ${C_RED}${C_BOLD}${password}${C_RESET}"
+  else
+    echo -e "  ${C_BOLD}🔑 Password:${C_RESET}   ${C_DIM}(see SOVIEZ_APP_PASSWORD in ${ENV_FILE})${C_RESET}"
+  fi
+  echo -e "  ${C_YELLOW}${C_BOLD}Save this password now — change it after first login.${C_RESET}"
+  echo -e "${C_GREEN}${C_BOLD}==============================================================${C_RESET}"
+  echo ""
+}
+
+prompt_yes_no_default_no() {
+  local question="$1" answer
+  read -r -p "${question} (y/N): " answer
+  case "${answer}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Soft-delete helpers (never abort the teardown pipeline if a target is already gone).
+docker_stop_rm_soft() {
+  local name="$1"
+  docker stop "${name}" >/dev/null 2>&1 || true
+  docker rm -f "${name}" >/dev/null 2>&1 || true
+}
+
+docker_volume_rm_soft() {
+  local name="$1"
+  docker volume rm "${name}" >/dev/null 2>&1 || true
+}
+
+docker_network_rm_soft() {
+  local name="$1"
+  docker network rm "${name}" >/dev/null 2>&1 || true
+}
+
+reload_nginx_soft() {
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t >>"${LOG_FILE}" 2>&1 && systemctl reload nginx >>"${LOG_FILE}" 2>&1 || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Public IP / DNS / Nginx / Certbot / UFW  (--init / --new)
 # ---------------------------------------------------------------------------
 detect_public_ip() {
@@ -1539,6 +1755,73 @@ normalize_domain() {
   printf '%s\n' "${d}"
 }
 
+# Optional: set before prompt_domain_confirmed during --change-domain so the
+# current tenant's own env/nginx mapping is not treated as a collision.
+DOMAIN_UNIQUENESS_EXCLUDE_ENV=""
+
+# Strict domain uniqueness across env sheets + Nginx vhosts.
+# Returns 1 on conflict when stdin is a TTY (interactive retry).
+# Exits 1 on conflict when non-interactive (piped / scripted).
+ensure_domain_is_unique() {
+  local domain="$1"
+  local exclude_env="${2:-${DOMAIN_UNIQUENESS_EXCLUDE_ENV:-}}"
+  local path real real_exclude="" exclude_domain="" existing
+  local conflict=0
+  local nginx_site=""
+
+  domain="$(normalize_domain "${domain}")"
+  if [[ -z "${domain}" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${exclude_env}" && -e "${exclude_env}" ]]; then
+    real_exclude="$(readlink -f "${exclude_env}" 2>/dev/null || printf '%s\n' "${exclude_env}")"
+    exclude_domain="$(grep -E '^SOVIEZ_TENANT_DOMAIN=' "${exclude_env}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    exclude_domain="$(normalize_domain "${exclude_domain}")"
+  fi
+
+  # --- Source of truth 1: tenant environment sheets ---
+  while IFS= read -r path; do
+    [[ -n "${path}" && -f "${path}" ]] || continue
+    real="$(readlink -f "${path}" 2>/dev/null || printf '%s\n' "${path}")"
+    if [[ -n "${real_exclude}" && "${real}" == "${real_exclude}" ]]; then
+      continue
+    fi
+    existing="$(grep -E '^SOVIEZ_TENANT_DOMAIN=' "${path}" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    existing="$(normalize_domain "${existing}")"
+    if [[ -n "${existing}" && "${existing}" == "${domain}" ]]; then
+      conflict=1
+      log_file "Domain conflict: ${domain} already in env sheet ${path}"
+      break
+    fi
+  done < <(collect_tenant_env_paths 2>/dev/null || true)
+
+  # --- Source of truth 2: Nginx vhost files ---
+  nginx_site="/etc/nginx/sites-available/soviez-${domain}.conf"
+  if (( conflict == 0 )) && [[ -f "${nginx_site}" ]]; then
+    # Allow when this vhost belongs to the tenant we are rebinding (same FQDN).
+    if [[ -n "${exclude_domain}" && "${exclude_domain}" == "${domain}" ]]; then
+      log_file "Domain ${domain} nginx vhost owned by excluded tenant — allowing"
+    else
+      conflict=1
+      log_file "Domain conflict: nginx vhost exists at ${nginx_site}"
+    fi
+  fi
+
+  if (( conflict == 0 )); then
+    return 0
+  fi
+
+  echo -e "${C_RED}${C_BOLD}[ERROR] Domain '${domain}' is already mapped to an existing tenant on this server!${C_RESET}" >&2
+  log_file "ERROR Domain '${domain}' is already mapped to an existing tenant on this server!"
+
+  # Interactive (TTY): let the caller re-prompt. Non-interactive: hard abort.
+  if [[ -t 0 ]]; then
+    return 1
+  fi
+  exit 1
+}
+
 prompt_domain_confirmed() {
   local d1 d2
   while true; do
@@ -1553,6 +1836,11 @@ prompt_domain_confirmed() {
     d2="$(normalize_domain "${d2}")"
     if [[ "${d1}" != "${d2}" ]]; then
       ui_warn "Domains did not match. Try again."
+      continue
+    fi
+    # Reject collisions before DNS / Nginx mutation.
+    if ! ensure_domain_is_unique "${d1}"; then
+      ui_warn "Choose a different domain that is not already in use on this host."
       continue
     fi
     TENANT_DOMAIN="${d1}"
@@ -2263,11 +2551,169 @@ ensure_ufw() {
   ui_ok "UFW active — ports 22 / 80 / 443 allowed"
 }
 
+# Idempotent Docker daemon log rotation (prevents unbounded container logs).
+ensure_docker_log_rotation() {
+  local changed=0
+  mkdir -p /etc/docker
+
+  if [[ ! -f "${DOCKER_DAEMON_JSON}" ]]; then
+    cat > "${DOCKER_DAEMON_JSON}" <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  }
+}
+EOF
+    changed=1
+  else
+    set +e
+    python3 - "${DOCKER_DAEMON_JSON}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+want_driver = "json-file"
+want_opts = {"max-size": "50m", "max-file": "3"}
+changed = False
+
+if data.get("log-driver") != want_driver:
+    data["log-driver"] = want_driver
+    changed = True
+
+opts = data.get("log-opts")
+if not isinstance(opts, dict):
+    opts = {}
+    changed = True
+
+for key, value in want_opts.items():
+    if str(opts.get(key, "")) != value:
+        opts[key] = value
+        changed = True
+
+data["log-opts"] = opts
+if changed:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    sys.exit(0)
+sys.exit(1)
+PY
+    local py_rc=$?
+    set -e
+    if (( py_rc == 0 )); then
+      changed=1
+    fi
+  fi
+
+  if (( changed == 1 )); then
+    ui_wait "Restarting Docker to apply log rotation limits..."
+    systemctl restart docker >>"${LOG_FILE}" 2>&1 || {
+      ui_error "Docker restart failed after daemon.json update — see ${LOG_FILE}"
+      return 1
+    }
+    ui_ok "Docker log rotation enforced (max-size=50m, max-file=3)"
+  else
+    ui_ok "Docker log rotation already configured"
+  fi
+}
+
+# Weekly prune of dangling images / stopped ephemeral containers (volumes untouched).
+ensure_docker_weekly_prune() {
+  mkdir -p /etc/cron.weekly
+  cat > "${DOCKER_PRUNE_CRON}" <<'EOF'
+#!/bin/bash
+# Soviez ERP — weekly Docker housekeeping (safe for active volumes)
+set -euo pipefail
+command -v docker >/dev/null 2>&1 || exit 0
+docker system prune -af --filter "until=168h" >/dev/null 2>&1 || true
+EOF
+  chmod 755 "${DOCKER_PRUNE_CRON}"
+  ui_ok "Weekly Docker prune cron installed (${DOCKER_PRUNE_CRON})"
+}
+
+ensure_fail2ban() {
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    show_progress "Installing Fail2Ban..." apt-get install -y fail2ban || {
+      ui_error "Fail2Ban install failed — see ${LOG_FILE}"
+      return 1
+    }
+  else
+    ui_ok "Fail2Ban already installed"
+  fi
+
+  mkdir -p /var/log/nginx
+  touch /var/log/nginx/access.log /var/log/nginx/error.log 2>/dev/null || true
+
+  mkdir -p /etc/fail2ban
+  cat > "${FAIL2BAN_JAIL_LOCAL}" <<'EOF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled = true
+port    = ssh
+filter  = sshd
+maxretry = 5
+
+[nginx-http-auth]
+enabled = true
+port    = http,https
+filter  = nginx-http-auth
+logpath = /var/log/nginx/error.log
+maxretry = 5
+
+[nginx-botsearch]
+enabled = true
+port    = http,https
+filter  = nginx-botsearch
+logpath = /var/log/nginx/access.log
+maxretry = 2
+EOF
+
+  systemctl enable --now fail2ban >>"${LOG_FILE}" 2>&1 || {
+    ui_error "Failed to enable Fail2Ban — see ${LOG_FILE}"
+    return 1
+  }
+  # Reload jails after writing jail.local (idempotent).
+  systemctl reload fail2ban >>"${LOG_FILE}" 2>&1 || systemctl restart fail2ban >>"${LOG_FILE}" 2>&1 || true
+  ui_ok "Fail2Ban active (sshd + nginx-http-auth + nginx-botsearch)"
+}
+
+ensure_certbot_nginx_reload_hook() {
+  mkdir -p /etc/letsencrypt/renewal-hooks/post
+  cat > "${CERTBOT_NGINX_RELOAD_HOOK}" <<'EOF'
+#!/bin/bash
+# Soviez ERP — reload Nginx after Let's Encrypt renewal
+set -euo pipefail
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+  systemctl reload nginx
+elif command -v nginx >/dev/null 2>&1; then
+  nginx -s reload
+fi
+EOF
+  chmod 755 "${CERTBOT_NGINX_RELOAD_HOOK}"
+  ui_ok "Certbot post-hook installed (Nginx reload on renew)"
+}
+
 print_elite_welcome() {
   local domain="$1"
   local addons_path="$2"
-  local admin_password="$3"
-  local index="$4"
+  local index="$3"
+  local app_password="${SOVIEZ_APP_PASSWORD:-}"
 
   clear 2>/dev/null || true
   echo ""
@@ -2285,9 +2731,15 @@ BANNER
   echo -e "  ${C_GREEN}✔${C_RESET}  ${C_BOLD}Welcome to the Soviez ERP ecosystem!${C_RESET}"
   echo -e "  ${C_GREEN}✔${C_RESET}  Tenant instance #${index} is live and secured."
   echo ""
-  echo -e "  ${C_BOLD}Live URL${C_RESET}"
-  echo -e "     ${C_CYAN}https://${domain}${C_RESET}"
+
+  print_tenant_login_banner "${domain}" "${app_password}"
+
+  echo -e "  ${C_BOLD}Next steps${C_RESET}"
+  echo -e "     1. Open ${C_CYAN}https://${domain}${C_RESET}"
+  echo -e "     2. Sign in with ${C_BOLD}admin${C_RESET} and the password shown above (change after first login)"
+  echo -e "     3. Enter your Soviez License Code in the License Guard / activation screen"
   echo ""
+
   echo -e "  ${C_BOLD}Custom addons folder${C_RESET}"
   echo -e "     ${C_CYAN}${addons_path}${C_RESET}"
   echo -e "     ${C_DIM}Drop Odoo modules here, then refresh Apps or run ./soviez.sh --update${C_RESET}"
@@ -2296,9 +2748,6 @@ BANNER
     echo -e "  ${C_DIM}Re-attempt Let's Encrypt later: sudo ./soviez.sh --formssl ${domain}${C_RESET}"
     echo ""
   fi
-  print_master_password_alert \
-    "${admin_password}" \
-    "INSTANCE #${index} — DATABASE MASTER PASSWORD (SAVE THIS NOW)"
   echo -e "  ${C_DIM}Full setup log: ${LOG_FILE}${C_RESET}"
   echo ""
 }
@@ -2322,10 +2771,12 @@ mode_init() {
       exit 1
     }
 
-  show_progress "Installing base utilities (curl, ca-certificates)..." \
-    apt-get install -y curl ca-certificates gnupg lsb-release || true
+  show_progress "Installing base utilities (curl, ca-certificates, python3)..." \
+    apt-get install -y curl ca-certificates gnupg lsb-release python3 || true
 
   install_docker_engine
+  show_progress "Configuring Docker log rotation..." ensure_docker_log_rotation || exit 1
+  show_progress "Installing weekly Docker prune cron..." ensure_docker_weekly_prune
 
   if ! command -v nginx >/dev/null 2>&1; then
     show_progress "Installing Nginx..." apt-get install -y nginx || exit 1
@@ -2338,10 +2789,13 @@ mode_init() {
   show_progress "Installing Certbot + python3-certbot-nginx..." bash -c \
     'apt-get install -y certbot python3-certbot-nginx' || exit 1
   ensure_certbot_nginx_plugin || exit 1
+  show_progress "Installing Certbot Nginx reload hook..." ensure_certbot_nginx_reload_hook
 
   ensure_ufw
+  show_progress "Installing Fail2Ban (SSH + Nginx jails)..." ensure_fail2ban || exit 1
 
   print_green_success "Host environment successfully initialized!"
+  echo -e "  Day-2 hardening active: Docker log limits, weekly prune, Fail2Ban, SSL renew hook."
   echo -e "  You can now provision tenants using:"
   echo -e "    ${C_BOLD}sudo ./soviez.sh --new${C_RESET}"
   echo -e "  ${C_DIM}Local wizard path: $(pwd)/soviez.sh${C_RESET}"
@@ -2375,6 +2829,8 @@ mode_new() {
     "This wizard will create an isolated container stack + HTTPS site."
 
   prompt_domain_confirmed
+  # Belt-and-suspenders: uniqueness already enforced in the prompt loop.
+  ensure_domain_is_unique "${TENANT_DOMAIN}" || exit 1
   dns_validation_loop "${public_ip}" "${TENANT_DOMAIN}"
 
   mkdir -p "${INSTANCE_ROOT}"
@@ -2411,8 +2867,10 @@ SOVIEZ_CUSTOM_ADDONS_MOUNT=${CUSTOM_ADDONS_CONTAINER_PATH}
 SOVIEZ_TENANT_DOMAIN=${TENANT_DOMAIN}
 SOVIEZ_PUBLIC_IP=${public_ip}
 SOVIEZ_AUTO_TUNE=${AUTO_TUNE_ON_NEW}
+SOVIEZ_DB_NAME=${DEFAULT_APP_DB_NAME}
 EOF
   chmod 600 "${ENV_FILE}"
+  SOVIEZ_DB_NAME="${DEFAULT_APP_DB_NAME}"
 
   show_progress "Pulling container images..." bash -c \
     "docker pull '${APP_IMAGE}' && docker pull '${DB_IMAGE}'"
@@ -2439,11 +2897,168 @@ EOF
     apply_tenant_resource_tuning || ui_warn "Auto-tuning failed — retry with: sudo ./soviez.sh --formworkers ${WEB_CONTAINER}"
   fi
 
+  show_progress "Provisioning application database (${DEFAULT_APP_DB_NAME})..." \
+    provision_application_database || {
+      ui_error "Application database provisioning failed — see ${LOG_FILE}"
+      exit 1
+    }
+
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
     "${CUSTOM_ADDONS_HOST_PATH}" \
-    "${SOVIEZ_ADMIN_PASSWORD}" \
     "${next_index}"
+}
+
+# ===========================================================================
+# MODE: purge — irreversible tenant obliteration
+# ===========================================================================
+mode_purge() {
+  require_root --purge
+  ensure_log_file
+  require_cmd docker
+
+  if [[ -z "${PURGE_TENANT_REF}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --purge <tenant>"
+    ui_error "Example: sudo ./soviez.sh --purge soviez-web-1"
+    exit 1
+  fi
+
+  load_tenant_topology_from_ref "${PURGE_TENANT_REF}"
+  resolve_custom_addons_host_path
+
+  local tenant_name="${WEB_CONTAINER}"
+  local domain="${SOVIEZ_TENANT_DOMAIN:-${TENANT_DOMAIN:-}}"
+  local addons_tree conf_tree typed
+
+  # Parent of .../addons → /soviez/soviez_web_N
+  addons_tree=""
+  if [[ -n "${CUSTOM_ADDONS_HOST_PATH:-}" ]]; then
+    addons_tree="$(dirname "${CUSTOM_ADDONS_HOST_PATH}")"
+  fi
+  conf_tree="${SOVIEZ_VOLUME_ROOT}/${WEB_CONTAINER}"
+
+  print_border_box "Soviez ERP — PURGE (IRREVERSIBLE)" \
+    "Tenant: ${C_BOLD}${tenant_name}${C_RESET}" \
+    "Domain: ${C_BOLD}${domain:-unknown}${C_RESET}" \
+    "Env: ${ENV_FILE}" \
+    "" \
+    "This destroys containers, volumes, network, env sheet, Nginx, and host dirs."
+
+  echo ""
+  echo -e "${C_RED}${C_BOLD}⚠️  WARNING: This will irreversibly destroy ALL data, containers, and configs for ${tenant_name}.${C_RESET}"
+  read -r -p "To proceed, type the exact tenant name: " typed
+  if [[ "${typed}" != "${tenant_name}" ]]; then
+    ui_error "Aborted — typed name does not match '${tenant_name}'."
+    exit 1
+  fi
+
+  ui_wait "Stopping and removing containers..."
+  docker_stop_rm_soft "${WEB_CONTAINER}"
+  docker_stop_rm_soft "${DB_CONTAINER}"
+  ui_ok "Containers removed (or already absent)"
+
+  ui_wait "Removing Docker volumes..."
+  docker_volume_rm_soft "${DB_VOLUME}"
+  docker_volume_rm_soft "${FILESTORE_VOLUME}"
+  ui_ok "Volumes removed (or already absent)"
+
+  ui_wait "Removing Docker network ${NETWORK_NAME}..."
+  docker_network_rm_soft "${NETWORK_NAME}"
+  ui_ok "Network removed (or already absent)"
+
+  if [[ -f "${ENV_FILE}" ]]; then
+    rm -f "${ENV_FILE}" || true
+    ui_ok "Deleted env sheet ${ENV_FILE}"
+  fi
+
+  if [[ -n "${conf_tree}" && -d "${conf_tree}" ]]; then
+    rm -rf "${conf_tree}" || true
+    ui_ok "Deleted runtime config tree ${conf_tree}"
+  fi
+
+  if [[ -n "${addons_tree}" && -d "${addons_tree}" && "${addons_tree}" == /soviez/* ]]; then
+    rm -rf "${addons_tree}" || true
+    ui_ok "Deleted custom addons tree ${addons_tree}"
+  fi
+
+  if [[ -n "${domain}" ]]; then
+    remove_nginx_site_for_domain "${domain}"
+    reload_nginx_soft
+    ui_ok "Nginx vhost removed for ${domain}"
+  fi
+
+  print_green_success "Tenant ${tenant_name} purged — no residual stack assets remain."
+  echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
+  echo ""
+}
+
+# ===========================================================================
+# MODE: rebuild — wipe DB/filestore; keep domain, env, custom addons
+# ===========================================================================
+mode_rebuild() {
+  require_root --rebuild
+  ensure_log_file
+  require_cmd docker
+  require_cmd python3
+  ensure_host_ledger_dir
+
+  if [[ -z "${REBUILD_TENANT_REF}" ]]; then
+    ui_error "Usage: sudo ./soviez.sh --rebuild <tenant>"
+    ui_error "Example: sudo ./soviez.sh --rebuild soviez-web-1"
+    exit 1
+  fi
+
+  load_tenant_topology_from_ref "${REBUILD_TENANT_REF}"
+  resolve_custom_addons_host_path
+  require_complete_env
+
+  local tenant_name="${WEB_CONTAINER}"
+  local domain="${SOVIEZ_TENANT_DOMAIN:-${TENANT_DOMAIN:-}}"
+
+  print_border_box "Soviez ERP — Rebuild Tenant" \
+    "Tenant: ${C_BOLD}${tenant_name}${C_RESET}" \
+    "Domain: ${C_BOLD}${domain:-unknown}${C_RESET}" \
+    "Keeps: env sheet, custom addons, Nginx/domain" \
+    "Wipes: Postgres volume + filestore volume + application DB"
+
+  if ! prompt_yes_no_default_no "Are you sure you want to rebuild ${tenant_name}? This will wipe the database and filestore, but keep custom addons and domain."; then
+    ui_error "Rebuild aborted."
+    exit 1
+  fi
+
+  ui_wait "Stopping and removing containers..."
+  docker_stop_rm_soft "${WEB_CONTAINER}"
+  docker_stop_rm_soft "${DB_CONTAINER}"
+
+  ui_wait "Dropping data volumes..."
+  docker_volume_rm_soft "${DB_VOLUME}"
+  docker_volume_rm_soft "${FILESTORE_VOLUME}"
+
+  ensure_custom_addons_dir
+  show_progress "Recreating network and volumes..." ensure_network_and_volumes
+  show_progress "Starting PostgreSQL (${DB_CONTAINER})..." ensure_postgres_container
+  show_progress "Launching Soviez ERP (${WEB_CONTAINER})..." launch_web_container
+
+  # Re-apply Docker cgroup limits if previously tuned
+  if [[ -n "${SOVIEZ_DOCKER_CPUS:-}" || -n "${SOVIEZ_DOCKER_MEM_MB:-}" ]]; then
+    docker update \
+      ${SOVIEZ_DOCKER_CPUS:+--cpus="${SOVIEZ_DOCKER_CPUS}"} \
+      ${SOVIEZ_DOCKER_MEM_MB:+--memory="${SOVIEZ_DOCKER_MEM_MB}m" --memory-swap="${SOVIEZ_DOCKER_MEM_MB}m"} \
+      "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  fi
+
+  SOVIEZ_DB_NAME="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
+  show_progress "Provisioning fresh application database (${SOVIEZ_DB_NAME})..." \
+    provision_application_database || {
+      ui_error "Rebuild database provisioning failed — see ${LOG_FILE}"
+      exit 1
+    }
+
+  print_green_success "Tenant ${tenant_name} rebuilt."
+  print_tenant_login_banner "${domain:-localhost}"
+  echo -e "  Custom addons preserved at: ${C_CYAN}${CUSTOM_ADDONS_HOST_PATH}${C_RESET}"
+  echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
+  echo ""
 }
 
 # ===========================================================================
@@ -2558,7 +3173,6 @@ mode_formsetup() {
   print_elite_welcome \
     "${TENANT_DOMAIN}" \
     "${CUSTOM_ADDONS_HOST_PATH}" \
-    "${SOVIEZ_ADMIN_PASSWORD}" \
     "${INSTANCE_INDEX}"
 }
 
@@ -2806,7 +3420,7 @@ mode_recover() {
     exit 1
   fi
 
-  ui_info "Rotating Database Master Password..."
+  ui_info "Rotating internal admin_passwd (SOVIEZ_ADMIN_PASSWORD)..."
   SOVIEZ_ADMIN_PASSWORD="$(generate_password)"
   persist_env_key "SOVIEZ_ADMIN_PASSWORD" "${SOVIEZ_ADMIN_PASSWORD}"
   load_env_file
@@ -2816,10 +3430,10 @@ mode_recover() {
   show_progress "Pulling ${APP_IMAGE}..." docker pull "${APP_IMAGE}"
   show_progress "Recycling ${WEB_CONTAINER}..." launch_web_container
 
-  print_master_password_alert \
-    "${SOVIEZ_ADMIN_PASSWORD}" \
-    "MASTER PASSWORD RESET — APPLICATION LAYER RECYCLED"
-  ui_ok "Master Password reset. Volumes preserved."
+  print_green_success "Internal admin_passwd rotated (SOVIEZ_ADMIN_PASSWORD)."
+  echo -e "  Stored only in ${C_BOLD}${ENV_FILE}${C_RESET} — not printed to the terminal."
+  echo -e "  Retrieve (root): ${C_DIM}grep '^SOVIEZ_ADMIN_PASSWORD=' ${ENV_FILE}${C_RESET}"
+  ui_ok "Web container recycled. Volumes preserved."
 }
 
 # ===========================================================================
@@ -3256,7 +3870,7 @@ mode_stage() {
 
   print_green_success "Staging ready: ${STAGE_DB_NAME} (from ${STAGE_SOURCE_DB})"
   echo -e "  Tenant web: ${C_BOLD}${WEB_CONTAINER}${C_RESET}"
-  echo -e "  Select database ${C_CYAN}${STAGE_DB_NAME}${C_RESET} in the Web Database Manager / dbfilter UI"
+  echo -e "  Select database ${C_CYAN}${STAGE_DB_NAME}${C_RESET} at login (or via dbfilter)"
   echo -e "  Drop later: ${C_BOLD}sudo ./soviez.sh --dropstage ${STAGE_TENANT_REF} ${STAGE_DB_NAME}${C_RESET}"
   echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
   echo ""
@@ -3664,13 +4278,19 @@ mode_change_domain() {
   fi
 
   echo -e "  Current domain: ${C_BOLD}${old_domain:-"(none)"}${C_RESET}"
+  # Ignore this tenant's own env/nginx mapping while choosing a replacement FQDN.
+  DOMAIN_UNIQUENESS_EXCLUDE_ENV="${ENV_FILE}"
   prompt_domain_confirmed
+  DOMAIN_UNIQUENESS_EXCLUDE_ENV=""
   new_domain="${TENANT_DOMAIN}"
 
   if [[ -n "${old_domain}" && "${old_domain}" == "${new_domain}" ]]; then
     ui_warn "New domain matches the current domain — nothing to change"
     exit 0
   fi
+
+  # Final gate before DNS / Nginx mutation (excludes current env sheet).
+  ensure_domain_is_unique "${new_domain}" "${ENV_FILE}" || exit 1
 
   public_ip="$(detect_public_ip)"
   PUBLIC_IP="${public_ip}"
@@ -3942,6 +4562,12 @@ case "${MODE}" in
     ;;
   formworkers)
     mode_formworkers
+    ;;
+  purge)
+    mode_purge
+    ;;
+  rebuild)
+    mode_rebuild
     ;;
   *)
     ui_error "Unknown mode: ${MODE}"

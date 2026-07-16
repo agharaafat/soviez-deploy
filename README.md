@@ -107,13 +107,13 @@ sudo ./soviez.sh --formssl
 | **Monitor** | `./soviez.sh --monitor` | Live stats for running `soviez-*` containers |
 | **Logs** | `./soviez.sh --logs <tenant>` | Follow tenant web container logs |
 | **Update** | `./soviez.sh --update` | Pull latest ERP image and upgrade schemas |
-| **Recover** | `./soviez.sh --recoverdbpass` | Rotate Database Master Password |
+| **Recover** | `./soviez.sh --recoverdbpass` | Rotate internal `admin_passwd` (env sheet) |
 
 The installer:
 
 - Keeps verbose detail in **`/var/log/soviez_setup.log`**; the terminal shows clean status lines only
-- On `--new`: creates an immutable `.soviez_N.env` (MAC, Postgres password, **Database Master Password**, host port from **8073**), starts **`postgres:16`** + **`soviez/soviez-erp:latest`**, mounts custom addons under `/soviez/soviez_web_N/addons`, writes Nginx `:80` + `:443` (self-signed baseline → Certbot), and prints the live **`https://your.domain`** URL
-- Flashes a high-visibility console alert with the Database Master Password — save it immediately
+- On `--new`: creates an immutable `.soviez_N.env` (MAC, Postgres password, internal `admin_passwd`, host port from **8073**), starts **`postgres:16`** + **`soviez/soviez-erp:latest`**, auto-provisions database `production` with login **`admin`** + a **random 12-character password**, mounts custom addons under `/soviez/soviez_web_N/addons`, writes Nginx `:80` + `:443` (self-signed baseline → Certbot), and prints the live **`https://your.domain`** URL with credentials + next-steps (login → license)
+- Stores `SOVIEZ_ADMIN_PASSWORD` in the env sheet for automation — it is **not** printed to the terminal after provision
 - If Let's Encrypt fails, keeps self-signed HTTPS online and reminds you to set Cloudflare SSL/TLS to **Full**
 
 Images:
@@ -130,17 +130,17 @@ Images:
 | **Web UI** | `https://<your-domain>` after `--new` |
 | **Image** | [`soviez/soviez-erp:latest`](https://hub.docker.com/r/soviez/soviez-erp) |
 
-**First boot:** open the HTTPS URL. Soviez ERP opens the interactive **Web Database Manager**. Enter the Master Password from the console alert (or `SOVIEZ_ADMIN_PASSWORD` in the tenant env sheet) to create a fresh database. After initialization, apply your perpetual activation key and proceed to Apps.
+**First boot:** open the HTTPS URL, sign in with **`admin`** and the **auto-generated password** from the success banner (also `SOVIEZ_APP_PASSWORD` in the tenant env sheet). Change that password after first login, then enter your **Soviez License Code** on the License Guard / activation screen and proceed to Apps.
 
-### 🔑 Database Master Password Reset & Recovery
+### 🔑 Internal admin_passwd reset (`--recoverdbpass`)
 
-Lost the Master Password? Rotate it without touching databases or volumes:
+Need to rotate the internal `--admin-passwd` without touching databases or volumes:
 
 ```bash
 sudo ./soviez.sh --recoverdbpass
 ```
 
-This injects a fresh secure master key into the env sheet, recycles only the web container, and displays the new token. Existing databases and Docker volumes are preserved.
+This injects a fresh secure key into the env sheet and recycles only the web container. The value is **not** printed to the terminal — retrieve it from the env sheet. Existing databases and Docker volumes are preserved.
 
 ### 🔄 Upgrading Application Containers & Database Schema
 
@@ -160,7 +160,7 @@ Spin parallel ERP clusters on one host:
 sudo ./soviez.sh --new
 ```
 
-Each run allocates the next index (`.soviez_1.env`, `.soviez_2.env`, …), creates sandboxed network/volume/container names, prepares `/soviez/soviez_web_N/addons`, binds a free port from **8073**, validates DNS for your domain, issues TLS, and flashes the new Master Password.
+Each run allocates the next index (`.soviez_1.env`, `.soviez_2.env`, …), creates sandboxed network/volume/container names, prepares `/soviez/soviez_web_N/addons`, binds a free port from **8073**, validates DNS for your domain, issues TLS, auto-provisions `production` with `admin` + a random password, and prints login next-steps (license activation).
 
 ### 🩹 Form Setup — Resume a Failed Provision
 
@@ -170,7 +170,7 @@ If `--new` stopped after writing secrets/containers but before HTTPS was fully o
 sudo ./soviez.sh --formsetup
 ```
 
-Resumes the latest half-configured tenant idempotently (keeps volumes, starts stopped containers, rewrites Nginx + HTTPS, reprints the welcome banner and Master Password). Safe to re-run.
+Resumes the latest half-configured tenant idempotently (keeps volumes, starts stopped containers, rewrites Nginx + HTTPS, reprints the welcome banner and login next-steps). Safe to re-run.
 
 ### 🔐 Form SSL — Fix HTTPS (Cloudflare / Let's Encrypt)
 
