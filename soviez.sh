@@ -24,6 +24,102 @@
 # Logs: /var/log/soviez_setup.log (verbose); terminal shows clean status UI only.
 set -euo pipefail
 
+# Installer version — bumped when soviez.sh behavior changes. Used by update_self().
+SOVIEZ_SCRIPT_VERSION="v0.1.0"
+
+# Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
+readonly SOVIEZ_SH_UPDATE_URLS=(
+  "https://raw.githubusercontent.com/Soviez/soviez-deploy/main/soviez.sh"
+  "https://soviez.sh"
+)
+
+# Auto-update this script from GitHub before any mode runs.
+# Loop-safe: SOVIEZ_SKIP_SELF_UPDATE=1 is set on re-exec after a successful replace.
+update_self() {
+  # Already refreshed in this process tree, or explicitly disabled.
+  if [[ "${SOVIEZ_SKIP_SELF_UPDATE:-}" == "1" ]]; then
+    return 0
+  fi
+
+  local self="${BASH_SOURCE[0]:-${0:-}}"
+  local base
+  base="$(basename -- "${self}" 2>/dev/null || printf '%s\n' "${self}")"
+
+  # Piped / process-substitution runs have no on-disk $0 to overwrite.
+  case "${base}" in
+    bash|sh|dash|zsh|-bash|-sh) return 0 ;;
+  esac
+  case "${self}" in
+    /dev/fd/*|/proc/self/fd/*) return 0 ;;
+  esac
+  if [[ ! -f "${self}" ]]; then
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo -e "\e[33m[WARN] You are currently offline. Unable to check for the latest version of soviez.sh. You might be running an outdated version; it is highly recommended to be online so the script can auto-update itself.\e[0m"
+    return 0
+  fi
+
+  local url="" tmp="" remote_ver="" local_ver remote_cmp local_cmp newest
+  tmp="$(mktemp "${TMPDIR:-/tmp}/soviez.sh.update.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap 'rm -f "'"${tmp}"'"' RETURN
+
+  for url in "${SOVIEZ_SH_UPDATE_URLS[@]}"; do
+    if curl -fsS --connect-timeout 3 --max-time 30 "${url}" -o "${tmp}" 2>/dev/null; then
+      break
+    fi
+    url=""
+  done
+
+  if [[ -z "${url}" || ! -s "${tmp}" ]]; then
+    echo -e "\e[33m[WARN] You are currently offline. Unable to check for the latest version of soviez.sh. You might be running an outdated version; it is highly recommended to be online so the script can auto-update itself.\e[0m"
+    return 0
+  fi
+
+  remote_ver="$(
+    grep -E '^[[:space:]]*SOVIEZ_SCRIPT_VERSION=' "${tmp}" 2>/dev/null \
+      | head -n1 \
+      | cut -d= -f2- \
+      | tr -d '[:space:]"'\' || true
+  )"
+  if [[ -z "${remote_ver}" ]]; then
+    return 0
+  fi
+
+  local_ver="${SOVIEZ_SCRIPT_VERSION}"
+  local_cmp="${local_ver#v}"
+  remote_cmp="${remote_ver#v}"
+
+  if [[ "${local_cmp}" == "${remote_cmp}" ]]; then
+    return 0
+  fi
+
+  newest="$(printf '%s\n%s\n' "${local_cmp}" "${remote_cmp}" | sort -V | tail -n1)"
+  if [[ "${newest}" != "${remote_cmp}" ]]; then
+    # Local is newer or non-comparable — do not downgrade.
+    return 0
+  fi
+
+  echo -e "\e[36m[INFO]\e[0m Updating soviez.sh ${local_ver} → ${remote_ver}..."
+  chmod +x "${tmp}" || true
+  if ! mv -f "${tmp}" "${self}" 2>/dev/null; then
+    if ! cp -f "${tmp}" "${self}" 2>/dev/null; then
+      echo -e "\e[33m[WARN]\e[0m Could not overwrite ${self} (permission denied?). Continuing with local ${local_ver}."
+      return 0
+    fi
+    rm -f "${tmp}" || true
+  fi
+  chmod +x "${self}" || true
+  trap - RETURN
+
+  # Re-exec with original argv; skip a second update attempt this session.
+  exec env SOVIEZ_SKIP_SELF_UPDATE=1 "${self}" "$@"
+}
+
+update_self "$@"
+
 readonly APP_IMAGE="soviez/soviez-erp:latest"
 readonly DB_IMAGE="postgres:16"
 readonly UPGRADE_MODULES="base,local_license_guard,mail,web,web_enterprise,soviez_web_ui"
@@ -357,6 +453,29 @@ ui_info()  { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; log_file "INFO  $*"; }
 ui_ok()    { echo -e "${C_GREEN}[OK]${C_RESET}   $*"; log_file "OK    $*"; }
 ui_warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; log_file "WARN  $*"; }
 ui_error() { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; log_file "ERROR $*"; }
+
+# Non-blocking Debian/Ubuntu security-update hint (never runs apt upgrade).
+# Triggers when apt's update-success stamp is missing or older than 7 days.
+hint_os_security_updates() {
+  if ! command -v apt >/dev/null 2>&1 && ! command -v apt-get >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local stamp="/var/lib/apt/periodic/update-success-stamp"
+  local now mtime age
+  now="$(date +%s 2>/dev/null || printf '0\n')"
+  if [[ ! -f "${stamp}" ]]; then
+    echo -e "\e[33m[HINT] Your Linux OS has pending security updates. It is highly recommended to run 'apt update && apt upgrade -y' to secure your host server.\e[0m"
+    return 0
+  fi
+
+  mtime="$(stat -c %Y "${stamp}" 2>/dev/null || stat -f %m "${stamp}" 2>/dev/null || printf '0\n')"
+  age=$((now - mtime))
+  if (( age > 7 * 86400 )); then
+    echo -e "\e[33m[HINT] Your Linux OS has pending security updates. It is highly recommended to run 'apt update && apt upgrade -y' to secure your host server.\e[0m"
+  fi
+  return 0
+}
 ui_wait()  { echo -e "${C_BLUE}[WAIT]${C_RESET} $*"; log_file "WAIT  $*"; }
 
 require_root() {
@@ -3150,14 +3269,16 @@ mode_init() {
   ensure_log_file
   export DEBIAN_FRONTEND=noninteractive
 
-  print_border_box "Soviez ERP — Host Initialization" \
+  hint_os_security_updates
+
+  print_border_box "Soviez ERP — Host Initialization (${SOVIEZ_SCRIPT_VERSION})" \
     "Preparing a production-ready Ubuntu/Debian appliance." \
     "Containers are NOT launched in this mode." \
     "After success, provision tenants with: ./soviez.sh --new"
 
-  show_progress "Updating system components..." bash -c \
-    'apt-get update -y && apt-get upgrade -y' || {
-      ui_error "System update failed — see ${LOG_FILE}"
+  # Refresh package indexes only — do not apt-upgrade the host (avoids breaking changes).
+  show_progress "Refreshing apt package indexes..." apt-get update -y || {
+      ui_error "apt-get update failed — see ${LOG_FILE}"
       exit 1
     }
 
@@ -3212,7 +3333,7 @@ mode_new() {
   public_ip="$(detect_public_ip)"
   PUBLIC_IP="${public_ip}"
 
-  print_border_box "Welcome to Soviez ERP Tenant Provisioning" \
+  print_border_box "Welcome to Soviez ERP Tenant Provisioning (${SOVIEZ_SCRIPT_VERSION})" \
     "To proceed, you need a domain or subdomain pointed to this server's" \
     "Public IP: ${C_BOLD}${public_ip}${C_RESET}" \
     "" \
@@ -3655,6 +3776,7 @@ mode_formssl() {
 # ===========================================================================
 mode_update() {
   ensure_log_file
+  hint_os_security_updates
   require_cmd docker
   require_cmd python3
   ensure_host_ledger_dir
