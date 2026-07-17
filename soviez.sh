@@ -538,6 +538,36 @@ print("".join(secrets.choice(alphabet) for _ in range(32)))
 PY
 }
 
+# 64-char hex secret for license migration HMAC (SOVIEZ_MIGRATION_SECRET).
+generate_migration_secret() {
+  python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+}
+
+# Ensure the tenant env sheet has SOVIEZ_MIGRATION_SECRET and export it.
+# Generates a strong random value once; never overwrites an existing secret.
+ensure_migration_secret() {
+  if [[ -z "${SOVIEZ_MIGRATION_SECRET:-}" && -n "${ENV_FILE:-}" && -f "${ENV_FILE}" ]]; then
+    SOVIEZ_MIGRATION_SECRET="$(
+      grep -E '^SOVIEZ_MIGRATION_SECRET=' "${ENV_FILE}" 2>/dev/null \
+        | head -1 | cut -d= -f2- || true
+    )"
+  fi
+  if [[ -z "${SOVIEZ_MIGRATION_SECRET:-}" ]]; then
+    SOVIEZ_MIGRATION_SECRET="$(generate_migration_secret)"
+    if [[ -n "${ENV_FILE:-}" && -f "${ENV_FILE}" ]]; then
+      persist_env_key "SOVIEZ_MIGRATION_SECRET" "${SOVIEZ_MIGRATION_SECRET}"
+    fi
+  fi
+  if [[ -z "${SOVIEZ_MIGRATION_SECRET:-}" ]]; then
+    ui_error "Failed to generate SOVIEZ_MIGRATION_SECRET."
+    return 1
+  fi
+  export SOVIEZ_MIGRATION_SECRET
+}
+
 # 12-character alphanumeric ERP login password (Day-1 admin user).
 generate_app_password() {
   python3 - <<PY
@@ -1441,6 +1471,8 @@ _docker_run_web_container() {
     docker_limits+=(--memory="${SOVIEZ_DOCKER_MEM_MB}m" --memory-swap="${SOVIEZ_DOCKER_MEM_MB}m")
   fi
 
+  ensure_migration_secret || return 1
+
   set +e
   docker run -d \
     --name "${WEB_CONTAINER}" \
@@ -1451,6 +1483,7 @@ _docker_run_web_container() {
     -e POSTGRES_USER=soviez \
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
     "${docker_limits[@]}" \
     "${volume_args[@]}" \
     "${APP_IMAGE}" \
@@ -1472,6 +1505,17 @@ _docker_run_web_container() {
   return 0
 }
 
+# True when the web container is missing SOVIEZ_MIGRATION_SECRET in its env.
+web_missing_migration_secret() {
+  local val
+  container_exists "${WEB_CONTAINER}" || return 0
+  val="$(
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${WEB_CONTAINER}" 2>/dev/null \
+      | grep -E '^SOVIEZ_MIGRATION_SECRET=' | head -1 || true
+  )"
+  [[ -z "${val#SOVIEZ_MIGRATION_SECRET=}" ]]
+}
+
 # Canonical web bring-up used by --new / --formsetup / --rebuild / --update.
 # Pass 1 to force recreate even if a container already exists.
 start_web_container() {
@@ -1480,17 +1524,18 @@ start_web_container() {
   ensure_host_ledger_dir
   ensure_custom_addons_dir
   ensure_tenant_soviez_conf
+  ensure_migration_secret || return 1
 
   if (( force == 1 )) && container_exists "${WEB_CONTAINER}"; then
     docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
   fi
 
   if container_running "${WEB_CONTAINER}"; then
-    if web_needs_addons_remount; then
-      ui_wait "Recycling ${WEB_CONTAINER} to attach custom addons mount..."
+    if web_needs_addons_remount || web_missing_migration_secret; then
+      ui_wait "Recycling ${WEB_CONTAINER} to refresh mounts/env (migration secret / addons)..."
       docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
       _docker_run_web_container || return 1
-      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
+      ui_ok "Web ERP recreated (${WEB_CONTAINER})"
       return 0
     fi
     ui_ok "Web ERP already running (${WEB_CONTAINER})"
@@ -1498,11 +1543,11 @@ start_web_container() {
   fi
 
   if container_exists "${WEB_CONTAINER}"; then
-    if web_needs_addons_remount; then
-      ui_wait "Recycling stopped ${WEB_CONTAINER} to attach custom addons mount..."
+    if web_needs_addons_remount || web_missing_migration_secret; then
+      ui_wait "Recycling stopped ${WEB_CONTAINER} to refresh mounts/env (migration secret / addons)..."
       docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
       _docker_run_web_container || return 1
-      ui_ok "Web ERP recreated with addons mount (${WEB_CONTAINER})"
+      ui_ok "Web ERP recreated (${WEB_CONTAINER})"
       return 0
     fi
     ui_wait "Starting stopped web ERP (${WEB_CONTAINER})..."
@@ -1570,6 +1615,8 @@ run_schema_upgrades() {
     return 0
   fi
 
+  ensure_migration_secret || return 1
+
   for dbname in "${dbs[@]}"; do
     [[ -z "${dbname}" ]] && continue
     if [[ ! "${dbname}" =~ ^[A-Za-z0-9_:-]+$ ]]; then
@@ -1583,6 +1630,7 @@ run_schema_upgrades() {
       --mac-address "${SOVIEZ_CONTAINER_MAC}" \
       -e POSTGRES_USER=soviez \
       -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
       "${volume_args[@]}" \
       "${APP_IMAGE}" \
       python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
@@ -1612,6 +1660,7 @@ require_complete_env() {
     ui_error "${ENV_FILE} is missing required secrets (MAC / DB password / admin password / host port)."
     exit 1
   fi
+  ensure_migration_secret || exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1681,6 +1730,7 @@ run_odoo_maintenance() {
   odoo_maintenance_volume_args volume_args
   addons_cli="$(addons_cli_for_runtime)"
   conf_path="$(odoo_maintenance_conf_path)"
+  ensure_migration_secret || return 1
 
   set +e
   docker run --rm \
@@ -1688,6 +1738,7 @@ run_odoo_maintenance() {
     -e POSTGRES_USER=soviez \
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
     "${volume_args[@]}" \
     "${APP_IMAGE}" \
     python3 soviez-bin -c "${conf_path}" \
@@ -1716,6 +1767,7 @@ run_odoo_maintenance_stdin() {
   odoo_maintenance_volume_args volume_args
   addons_cli="$(addons_cli_for_runtime)"
   conf_path="$(odoo_maintenance_conf_path)"
+  ensure_migration_secret || return 1
 
   set +e
   docker run --rm -i \
@@ -1723,6 +1775,7 @@ run_odoo_maintenance_stdin() {
     -e POSTGRES_USER=soviez \
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
     -e "SOVIEZ_RESET_LOGIN_B64=${SOVIEZ_RESET_LOGIN_B64:-}" \
     -e "SOVIEZ_RESET_PASS_B64=${SOVIEZ_RESET_PASS_B64:-}" \
     "${volume_args[@]}" \
@@ -3104,6 +3157,7 @@ mode_new() {
   SOVIEZ_CONTAINER_MAC="$(generate_mac)"
   SOVIEZ_DB_PASSWORD="$(generate_password)"
   SOVIEZ_ADMIN_PASSWORD="$(generate_password)"
+  SOVIEZ_MIGRATION_SECRET="$(generate_migration_secret)"
   SOVIEZ_HOST_PORT="$(find_free_host_port "${MULTI_PORT_START}")"
 
   cat > "${ENV_FILE}" <<EOF
@@ -3112,6 +3166,7 @@ SOVIEZ_HOST_PORT=${SOVIEZ_HOST_PORT}
 SOVIEZ_CONTAINER_MAC=${SOVIEZ_CONTAINER_MAC}
 SOVIEZ_DB_PASSWORD=${SOVIEZ_DB_PASSWORD}
 SOVIEZ_ADMIN_PASSWORD=${SOVIEZ_ADMIN_PASSWORD}
+SOVIEZ_MIGRATION_SECRET=${SOVIEZ_MIGRATION_SECRET}
 SOVIEZ_NETWORK_NAME=${NETWORK_NAME}
 SOVIEZ_DB_CONTAINER=${DB_CONTAINER}
 SOVIEZ_WEB_CONTAINER=${WEB_CONTAINER}
@@ -3960,12 +4015,14 @@ run_odoo_neutralize() {
   fi
 
   ui_wait "Running native neutralization on database ${dbname}..."
+  ensure_migration_secret || return 1
   # Prefer one-shot maintenance container (same pattern as --update); avoids -u odoo if absent.
   if docker run --rm \
       --network "${NETWORK_NAME}" \
       -e POSTGRES_USER="${DB_APP_USER}" \
       -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
       -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
       "${volume_args[@]}" \
       "${APP_IMAGE}" \
       python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
