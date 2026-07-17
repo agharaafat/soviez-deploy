@@ -2048,6 +2048,77 @@ print("\n".join(ips))
 PY
 }
 
+# Official Cloudflare IPv4 ranges (fallback when ips-v4 fetch is unavailable).
+# Source: https://www.cloudflare.com/ips-v4/
+_CLOUDFLARE_IPV4_CIDRS_FALLBACK=(
+  173.245.48.0/20
+  103.21.244.0/22
+  103.22.200.0/22
+  103.31.4.0/22
+  141.101.64.0/18
+  108.162.192.0/18
+  190.93.240.0/20
+  188.114.96.0/20
+  197.234.240.0/22
+  198.41.128.0/17
+  162.158.0.0/15
+  104.16.0.0/13
+  104.24.0.0/14
+  172.64.0.0/13
+  131.0.72.0/22
+)
+
+# True if $1 is an IPv4 address inside Cloudflare's published proxy ranges.
+is_cloudflare_proxy_ip() {
+  local ip="$1"
+  [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  CLOUDFLARE_IPV4_CIDRS_FALLBACK="${_CLOUDFLARE_IPV4_CIDRS_FALLBACK[*]}" \
+  python3 - "${ip}" <<'PY'
+import ipaddress
+import os
+import sys
+import urllib.request
+
+ip = ipaddress.ip_address(sys.argv[1])
+cidrs = []
+
+try:
+    with urllib.request.urlopen("https://www.cloudflare.com/ips-v4", timeout=6) as resp:
+        body = resp.read().decode("utf-8", "replace")
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            try:
+                cidrs.append(ipaddress.ip_network(line, strict=False))
+            except ValueError:
+                pass
+except Exception:
+    pass
+
+if not cidrs:
+    for tok in os.environ.get("CLOUDFLARE_IPV4_CIDRS_FALLBACK", "").split():
+        try:
+            cidrs.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            pass
+
+sys.exit(0 if any(ip in net for net in cidrs) else 1)
+PY
+}
+
+# True if any resolved address for the domain is a Cloudflare proxy edge IP.
+dns_resolves_via_cloudflare_proxy() {
+  local resolved_ips="$1"
+  local ip
+  while IFS= read -r ip; do
+    [[ -z "${ip}" ]] && continue
+    if is_cloudflare_proxy_ip "${ip}"; then
+      return 0
+    fi
+  done <<< "${resolved_ips}"
+  return 1
+}
+
 normalize_domain() {
   local d="$1"
   d="${d,,}"
@@ -2169,6 +2240,16 @@ dns_validation_loop() {
       return 0
     fi
 
+    # Orange-cloud / Cloudflare Proxy: A/AAAA points at CF edges, not the origin IP.
+    if (( rc == 0 )) && [[ -n "${resolved}" ]] && dns_resolves_via_cloudflare_proxy "${resolved}"; then
+      ui_info "Cloudflare Proxy detected for ${domain}. Proceeding safely."
+      echo -e "  ${C_DIM}Resolves via Cloudflare:${C_RESET} ${resolved//$'\n'/, }"
+      echo -e "  ${C_DIM}Origin Public IP (this host):${C_RESET} ${public_ip}"
+      echo -e "  ${C_DIM}Ensure Cloudflare SSL mode is Full (or Full strict) and the origin A record targets ${public_ip}.${C_RESET}"
+      log_file "Cloudflare Proxy accepted for ${domain} (resolved=${resolved//$'\n'/, }; origin=${public_ip})"
+      return 0
+    fi
+
     echo ""
     ui_warn "Domain is not pointed to this IP yet. DNS propagation can take up to 48 hours."
     if [[ -n "${resolved}" ]]; then
@@ -2177,6 +2258,7 @@ dns_validation_loop() {
       echo -e "  ${C_DIM}Currently resolves to:${C_RESET} (none / NXDOMAIN)"
     fi
     echo -e "  ${C_DIM}Expected Public IP:${C_RESET} ${public_ip}"
+    echo -e "  ${C_DIM}Tip:${C_RESET} Cloudflare Orange Cloud is OK — if you still see this warn, wait for DNS or type 'force'."
     echo ""
     read -r -p "Retry DNS check now? (y/n) — or type 'force' to override: " answer
     answer="${answer,,}"
