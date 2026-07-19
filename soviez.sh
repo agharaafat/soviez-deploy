@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
-SOVIEZ_SCRIPT_VERSION="v0.1.7"
+SOVIEZ_SCRIPT_VERSION="v0.1.8"
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
@@ -4718,7 +4718,7 @@ run_odoo_neutralize() {
     -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
     -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
   )
-  local db_user db_pass net_for_oneshot stage_web stage_conf
+  local db_user db_pass stage_web conf_in_container stage_conf_host
 
   assert_safe_dbname "${dbname}"
   db_user="${DB_APP_USER:-soviez}"
@@ -4734,52 +4734,53 @@ run_odoo_neutralize() {
     addons_cli="${addons_cli},${CUSTOM_ADDONS_CONTAINER_PATH}"
   fi
 
+  # Prefer freshly written stage tenant conf (embeds DSN); else image default + CLI DSN.
+  conf_in_container="/opt/soviez-erp/soviez.conf"
+  stage_conf_host="$(stage_soviez_conf_path 2>/dev/null || true)"
+  if [[ -n "${stage_conf_host}" && -f "${stage_conf_host}" ]]; then
+    volume_args+=(-v "${stage_conf_host}:/opt/soviez-erp/tenant.soviez.conf:ro")
+    conf_in_container="/opt/soviez-erp/tenant.soviez.conf"
+  fi
+
   ui_wait "Running native neutralization on database ${dbname}..."
   ensure_migration_secret || return 1
 
-  # Prefer tenant bridge for one-shot; stage DB can also use stage net once DB is attached.
-  net_for_oneshot="${NETWORK_NAME}"
-  if [[ "${dbname}" == "${STAGE_DB_NAME:-stage}" ]]; then
-    ensure_stage_docker_network
-    net_for_oneshot="${STAGE_NETWORK_NAME}"
-  fi
-
-  # Prefer one-shot maintenance container with explicit DSN (never rely on bare conf defaults).
+  # One-shot on the tenant bridge (DB already lives here). Use CLI subcommand:
+  #   soviez-bin neutralize …   NOT  soviez-bin … --neutralize
   if docker run --rm \
-      --network "${net_for_oneshot}" \
+      --network "${NETWORK_NAME}" \
       -e POSTGRES_USER="${db_user}" \
       -e POSTGRES_PASSWORD="${db_pass}" \
       -e PASSWORD="${db_pass}" \
       -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
       "${volume_args[@]}" \
       "${APP_IMAGE}" \
-      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+      python3 soviez-bin neutralize \
+        -c "${conf_in_container}" \
+        -d "${dbname}" \
         --addons-path="${addons_cli}" \
         --db_host="${DB_CONTAINER}" \
         --db_port=5432 \
         --db_user="${db_user}" \
         --db_password="${db_pass}" \
         --data-dir=/root/.local/share/Odoo \
-        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
-        -d "${dbname}" --neutralize --stop-after-init >>"${LOG_FILE}" 2>&1; then
+        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" >>"${LOG_FILE}" 2>&1; then
     ui_ok "Neutralize completed for ${dbname}"
     return 0
   fi
 
-  # Fallback A: exec into staging web (conf now embeds DSN) when neutralizing stage DB.
+  # Fallback A: exec into staging web when present (same neutralize subcommand + DSN flags).
   stage_web="$(stage_web_container_name 2>/dev/null || true)"
-  stage_conf="/opt/soviez-erp/tenant.soviez.conf"
   if [[ "${dbname}" == "${STAGE_DB_NAME:-stage}" ]] && [[ -n "${stage_web}" ]] && container_running "${stage_web}"; then
     ui_warn "Maintenance neutralize failed — retrying via docker exec ${stage_web}..."
     if docker exec "${stage_web}" \
         python3 soviez-bin neutralize \
-          -c "${stage_conf}" \
+          -c /opt/soviez-erp/tenant.soviez.conf \
           -d "${dbname}" \
           --db_host="${DB_CONTAINER}" \
           --db_port=5432 \
           --db_user="${db_user}" \
-          --db_password="${db_pass}" \
-          --stop-after-init >>"${LOG_FILE}" 2>&1; then
+          --db_password="${db_pass}" >>"${LOG_FILE}" 2>&1; then
       ui_ok "Neutralize completed via ${stage_web}"
       return 0
     fi
@@ -4789,13 +4790,13 @@ run_odoo_neutralize() {
   if container_running "${WEB_CONTAINER}"; then
     ui_warn "Maintenance neutralize failed — retrying via docker exec ${WEB_CONTAINER}..."
     if docker exec "${WEB_CONTAINER}" \
-        python3 soviez-bin -c /opt/soviez-erp/tenant.soviez.conf \
+        python3 soviez-bin neutralize \
+          -c /opt/soviez-erp/tenant.soviez.conf \
+          -d "${dbname}" \
           --db_host="${DB_CONTAINER}" \
           --db_port=5432 \
           --db_user="${db_user}" \
-          --db_password="${db_pass}" \
-          --data-dir=/root/.local/share/Odoo \
-          -d "${dbname}" --neutralize --stop-after-init >>"${LOG_FILE}" 2>&1; then
+          --db_password="${db_pass}" >>"${LOG_FILE}" 2>&1; then
       ui_ok "Neutralize completed via ${WEB_CONTAINER}"
       return 0
     fi
