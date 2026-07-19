@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
-SOVIEZ_SCRIPT_VERSION="v0.1.4"
+SOVIEZ_SCRIPT_VERSION="v0.1.6"
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
@@ -133,6 +133,8 @@ readonly CUSTOM_ADDONS_CONTAINER_PATH="/root/custom_addons"
 readonly BACKUP_ROOT="/var/soviez/backups"
 readonly BACKUP_SAFETY_MARGIN_BYTES=$((5 * 1024 * 1024 * 1024))
 readonly SOVIEZ_VOLUME_ROOT="/var/soviez/volumes"
+# Staging web runs here with a cloned production MAC (ARP-isolated from tenant bridge).
+readonly STAGE_NETWORK_NAME="soviez-net-stage"
 readonly RESOURCE_UTIL_WARN_PCT=80
 readonly RESOURCE_SYSTEM_REQUIREMENTS_URL="https://www.soviez.com/docs/system-requirements#size-production-server"
 readonly DEFAULT_APP_DB_NAME="production"
@@ -4679,18 +4681,24 @@ remove_filestore_dir() {
   ui_warn "Filestore path for ${dbname} not found — nothing to delete"
 }
 
+# Staging SQL fail-safe (target DB only): neutralize banner + purge stale assets.
+# CRITICAL: leave database.uuid and database.enterprise_code untouched — license
+# fingerprint matches production UUID + cloned production MAC on soviez-net-stage.
 mark_database_neutralized_sql() {
-  local dbname="$1"
-  assert_safe_dbname "${dbname}"
+  local target_db="$1"
+  assert_safe_dbname "${target_db}"
   docker exec "${DB_CONTAINER}" \
-    psql -U "${DB_APP_USER}" -d "${dbname}" -v ON_ERROR_STOP=1 -c \
+    psql -U "${DB_APP_USER}" -d "${target_db}" -v ON_ERROR_STOP=1 -c \
     "UPDATE ir_config_parameter SET value = 'True', write_date = NOW()
        WHERE key = 'database.is_neutralized';
      INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
      SELECT 'database.is_neutralized', 'True', 1, 1, NOW(), NOW()
      WHERE NOT EXISTS (
        SELECT 1 FROM ir_config_parameter WHERE key = 'database.is_neutralized'
-     );" >>"${LOG_FILE}" 2>&1
+     );
+     -- Stale production asset bundles break staging UI; force recompilation.
+     DELETE FROM ir_attachment WHERE url LIKE '/web/content/%';
+    " >>"${LOG_FILE}" 2>&1
 }
 
 run_odoo_neutralize() {
@@ -4753,7 +4761,7 @@ run_odoo_neutralize() {
 }
 
 # ===========================================================================
-# Isolated staging runtime (v0.1.3+) — stage.<domain> / custom FQDN + dbfilter
+# Isolated staging runtime (v0.1.6+) — prod MAC clone on soviez-net-stage
 # ===========================================================================
 stage_web_container_name() {
   printf '%s-stage\n' "${WEB_CONTAINER}"
@@ -4763,6 +4771,47 @@ stage_soviez_conf_path() {
   local stage_web
   stage_web="$(stage_web_container_name)"
   printf '%s/%s/conf/tenant.soviez.conf\n' "${SOVIEZ_VOLUME_ROOT}" "${stage_web}"
+}
+
+# Capture production web MAC for license fingerprint parity (works if container is stopped).
+resolve_production_web_mac() {
+  local web="${WEB_CONTAINER}"
+  local prod_mac=""
+
+  if container_exists "${web}"; then
+    # Prefer live NetworkSettings MAC (first attached network); works for running containers.
+    prod_mac="$(
+      docker inspect -f '{{range .NetworkSettings.Networks}}{{.MacAddress}} {{end}}' "${web}" 2>/dev/null \
+        | awk '{print $1}' | tr -d '[:space:]' || true
+    )"
+    # Stopped / empty NetworkSettings — fall back to Config.MacAddress.
+    if [[ -z "${prod_mac}" ]]; then
+      prod_mac="$(
+        docker inspect -f '{{.Config.MacAddress}}' "${web}" 2>/dev/null \
+          | tr -d '[:space:]' || true
+      )"
+    fi
+  fi
+
+  if [[ -z "${prod_mac}" ]]; then
+    prod_mac="${SOVIEZ_CONTAINER_MAC:-}"
+  fi
+
+  prod_mac="$(printf '%s' "${prod_mac}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ ! "${prod_mac}" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+    ui_error "Cannot resolve production MAC for ${web} (container missing/stopped and SOVIEZ_CONTAINER_MAC unset)"
+    return 1
+  fi
+  printf '%s\n' "${prod_mac}"
+}
+
+# ARP-isolated stage bridge + attach DB so stage web can reach Postgres by name.
+ensure_stage_docker_network() {
+  docker network create "${STAGE_NETWORK_NAME}" >/dev/null 2>&1 || true
+  if container_exists "${DB_CONTAINER}"; then
+    docker network connect "${STAGE_NETWORK_NAME}" "${DB_CONTAINER}" >/dev/null 2>&1 || true
+  fi
+  log_file "Stage network ready: ${STAGE_NETWORK_NAME} (DB=${DB_CONTAINER})"
 }
 
 # Derive stage.FQDN from the tenant's linked production domain.
@@ -4993,7 +5042,7 @@ allocate_stage_host_port() {
   return 0
 }
 
-# Dedicated staging web runner — isolated addons sandbox + dbfilter lock.
+# Dedicated staging web runner — prod MAC on soviez-net-stage + dbfilter lock.
 _docker_run_stage_web_container() {
   local stage_web stage_port stage_mac runtime_conf addons_cli dbfilter_re stage_addons
   local -a volume_args=() docker_limits=()
@@ -5011,11 +5060,12 @@ _docker_run_stage_web_container() {
   fi
   SOVIEZ_STAGE_HOST_PORT="${stage_port}"
   if [[ -z "${stage_mac}" ]]; then
-    ui_error "SOVIEZ_STAGE_CONTAINER_MAC is unset"
+    ui_error "SOVIEZ_STAGE_CONTAINER_MAC is unset (expected production MAC clone)"
     return 1
   fi
 
   ensure_host_ledger_dir
+  ensure_stage_docker_network
   ensure_stage_custom_addons_dir || return 1
   ensure_stage_soviez_conf "${STAGE_DB_NAME}"
   ensure_migration_secret || return 1
@@ -5046,7 +5096,7 @@ _docker_run_stage_web_container() {
   docker run -d \
     --name "${stage_web}" \
     --restart unless-stopped \
-    --network "${NETWORK_NAME}" \
+    --network "${STAGE_NETWORK_NAME}" \
     --mac-address "${stage_mac}" \
     -p "${stage_port}:8069" \
     -e POSTGRES_USER=soviez \
@@ -5099,7 +5149,7 @@ mode_stage() {
   require_cmd python3
   require_cmd nginx
 
-  local stage_domain stage_web public_ip dbfilter_re default_stage_domain
+  local stage_domain stage_web public_ip dbfilter_re default_stage_domain PROD_MAC
 
   if [[ -z "${STAGE_TENANT_REF}" ]]; then
     ui_error "Usage: sudo ./soviez.sh --stage <tenant|index> [source_db]"
@@ -5189,15 +5239,15 @@ mode_stage() {
     exit 1
   fi
 
-  # ---- Step D: neutralize ----
+  # ---- Step D: neutralize + staging SQL fail-safe (UUID rotate, assets purge) ----
   if ! run_odoo_neutralize "${STAGE_DB_NAME}"; then
     ui_warn "Native neutralize failed — applying SQL fail-safe only"
   fi
-  ui_wait "Fail-safe: setting database.is_neutralized=True..."
+  ui_wait "Fail-safe on ${STAGE_DB_NAME}: is_neutralized=True + purge /web/content assets (UUID/enterprise_code kept)..."
   if mark_database_neutralized_sql "${STAGE_DB_NAME}"; then
-    ui_ok "ir_config_parameter database.is_neutralized=True"
+    ui_ok "Staging SQL fail-safe applied (neutralized; identity keys intact; assets purged)"
   else
-    ui_error "Failed to set database.is_neutralized — see ${LOG_FILE}"
+    ui_error "Staging SQL fail-safe failed for ${STAGE_DB_NAME} — see ${LOG_FILE}"
     exit 1
   fi
 
@@ -5219,9 +5269,12 @@ mode_stage() {
     ui_error "Failed to allocate a valid staging host port"
     exit 1
   fi
-  if [[ -z "${SOVIEZ_STAGE_CONTAINER_MAC:-}" ]]; then
-    SOVIEZ_STAGE_CONTAINER_MAC="$(generate_mac)"
-  fi
+
+  # License fingerprint: clone production MAC onto ARP-isolated soviez-net-stage.
+  PROD_MAC="$(resolve_production_web_mac)" || exit 1
+  SOVIEZ_STAGE_CONTAINER_MAC="${PROD_MAC}"
+  ui_ok "Staging will reuse production MAC ${PROD_MAC} on ${STAGE_NETWORK_NAME}"
+  ensure_stage_docker_network
 
   persist_env_key "SOVIEZ_STAGE_DOMAIN" "${stage_domain}"
   persist_env_key "SOVIEZ_STAGE_HOST_PORT" "${SOVIEZ_STAGE_HOST_PORT}"
@@ -5229,6 +5282,7 @@ mode_stage() {
   persist_env_key "SOVIEZ_STAGE_CONTAINER_MAC" "${SOVIEZ_STAGE_CONTAINER_MAC}"
   persist_env_key "SOVIEZ_STAGE_DB_NAME" "${STAGE_DB_NAME}"
   persist_env_key "SOVIEZ_STAGE_ADDONS_HOST" "${STAGE_ADDONS_HOST_PATH:-${SOVIEZ_STAGE_ADDONS_HOST:-}}"
+  persist_env_key "SOVIEZ_STAGE_NETWORK" "${STAGE_NETWORK_NAME}"
   persist_env_key "_SOVIEZ_DBFILTER" "${dbfilter_re}"
   SOVIEZ_STAGE_DOMAIN="${stage_domain}"
 
@@ -5253,6 +5307,7 @@ mode_stage() {
   print_green_success "Staging ready: ${STAGE_DB_NAME} → https://${stage_domain}"
   echo -e "  Production web: ${C_BOLD}${WEB_CONTAINER}${C_RESET} (list_db=False — unchanged)"
   echo -e "  Staging web:    ${C_BOLD}${stage_web}${C_RESET} → 127.0.0.1:${SOVIEZ_STAGE_HOST_PORT}"
+  echo -e "  License MAC:    ${C_BOLD}${SOVIEZ_STAGE_CONTAINER_MAC}${C_RESET} on ${C_CYAN}${STAGE_NETWORK_NAME}${C_RESET}"
   echo -e "  Addons sandbox: ${C_BOLD}${STAGE_ADDONS_HOST_PATH:-${SOVIEZ_STAGE_ADDONS_HOST:-n/a}}${C_RESET}"
   echo -e "  DB lock:        ${C_CYAN}_SOVIEZ_DBFILTER=${dbfilter_re}${C_RESET} + conf dbfilter"
   echo -e "  Drop later:     ${C_BOLD}sudo ./soviez.sh --dropstage ${STAGE_TENANT_REF} ${STAGE_DB_NAME}${C_RESET}"
@@ -5346,6 +5401,7 @@ mode_dropstage() {
       persist_env_key "SOVIEZ_STAGE_WEB_CONTAINER" ""
       persist_env_key "SOVIEZ_STAGE_DB_NAME" ""
       persist_env_key "SOVIEZ_STAGE_ADDONS_HOST" ""
+      persist_env_key "SOVIEZ_STAGE_NETWORK" ""
       persist_env_key "_SOVIEZ_DBFILTER" ""
       persist_env_key "SOVIEZ_STAGE_SSL_MODE" ""
     fi
