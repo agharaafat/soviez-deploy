@@ -957,8 +957,34 @@ is_port_busy() {
 # Extract a single valid TCP port from polluted capture (ui noise / multiline).
 sanitize_host_port() {
   local raw="${1:-}"
-  local port=""
-  port="$(printf '%s' "${raw}" | tr -d '\r' | grep -oE '[0-9]{2,5}' | tail -n1 || true)"
+  local port="" cand=""
+
+  raw="$(printf '%s' "${raw}" | tr -d '\r')"
+  if [[ "${raw}" =~ ^[0-9]+$ ]] && (( raw >= 1 && raw <= 65535 )); then
+    printf '%s\n' "${raw}"
+    return 0
+  fi
+
+  # Prefer "Port <n>" from historical ui_warn pollution (avoid grabbing PIDs).
+  if [[ "${raw}" =~ [Pp]ort[[:space:]]+([0-9]{1,5}) ]]; then
+    port="${BASH_REMATCH[1]}"
+    if (( port >= 1 && port <= 65535 )); then
+      printf '%s\n' "${port}"
+      return 0
+    fi
+  fi
+
+  # Next: first token in the Soviez tenant/stage publish range.
+  while IFS= read -r cand; do
+    [[ "${cand}" =~ ^[0-9]+$ ]] || continue
+    if (( cand >= MULTI_PORT_START && cand <= PORT_SCAN_MAX )); then
+      printf '%s\n' "${cand}"
+      return 0
+    fi
+  done < <(printf '%s' "${raw}" | grep -oE '[0-9]{2,5}' || true)
+
+  # Last resort: first valid TCP port token.
+  port="$(printf '%s' "${raw}" | grep -oE '[0-9]{2,5}' | head -n1 || true)"
   if [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
     printf '%s\n' "${port}"
     return 0
@@ -1044,27 +1070,110 @@ print("".join(secrets.choice(alphabet) for _ in range(${APP_PASSWORD_LEN})))
 PY
 }
 
+# Double-quote an env value so sheets never treat metacharacters as shell syntax.
+shell_quote_env_value() {
+  local value="${1-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "${value}"
+}
+
 persist_env_key() {
   local key="$1"
   local value="$2"
-  local tmp
+  local tmp quoted
+  if [[ -z "${ENV_FILE:-}" ]]; then
+    ui_error "persist_env_key: ENV_FILE is unset"
+    return 1
+  fi
+  if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    ui_error "persist_env_key: invalid key '${key}'"
+    return 1
+  fi
+  quoted="$(shell_quote_env_value "${value}")"
   tmp="$(mktemp)"
   if [[ -f "${ENV_FILE}" ]]; then
     grep -v "^${key}=" "${ENV_FILE}" > "${tmp}" || true
   else
     : > "${tmp}"
   fi
-  echo "${key}=${value}" >> "${tmp}"
+  printf '%s=%s\n' "${key}" "${quoted}" >> "${tmp}"
   mv "${tmp}" "${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
 }
 
+# Parse KEY=VALUE sheets without `source` — tolerates polluted historical lines (e.g. WARN text with '(pid …)').
 load_env_file() {
-  # shellcheck disable=SC1090
-  set -a
-  # shellcheck source=/dev/null
-  source "${ENV_FILE}"
-  set +a
+  local line key raw cleaned healed=0
+  local -a rewrite_lines=()
+
+  if [[ -z "${ENV_FILE:-}" || ! -f "${ENV_FILE}" ]]; then
+    ui_error "Environment sheet missing: ${ENV_FILE:-"(unset)"}"
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # Preserve blank / comment lines on rewrite
+    if [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]]; then
+      rewrite_lines+=("${line}")
+      continue
+    fi
+
+    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      ui_warn "Ignoring malformed env line in ${ENV_FILE}: ${line:0:80}"
+      healed=1
+      continue
+    fi
+
+    key="${BASH_REMATCH[1]}"
+    raw="${BASH_REMATCH[2]}"
+
+    # Strip one layer of matching quotes (legacy + new persist_env_key format).
+    if [[ "${raw}" =~ ^\"(.*)\"$ ]]; then
+      raw="${BASH_REMATCH[1]}"
+      raw="${raw//\\\"/\"}"
+      raw="${raw//\\\\/\\}"
+      raw="${raw//\\\$/\$}"
+      raw="${raw//\\\`/\`}"
+    elif [[ "${raw}" =~ ^\'(.*)\'$ ]]; then
+      raw="${BASH_REMATCH[1]}"
+      raw="${raw//\'\\\'\'/\'}"
+    fi
+
+    # Heal port fields polluted by historical stdout WARN capture (parens / spaces).
+    if [[ "${key}" == *PORT* ]] && [[ ! "${raw}" =~ ^[0-9]+$ ]]; then
+      cleaned="$(sanitize_host_port "${raw}" 2>/dev/null || true)"
+      if [[ -n "${cleaned}" ]]; then
+        ui_warn "Healed ${key} in ${ENV_FILE}: extracted port ${cleaned}"
+        raw="${cleaned}"
+        healed=1
+      else
+        ui_warn "Clearing unusable ${key} value in ${ENV_FILE}"
+        raw=""
+        healed=1
+      fi
+    fi
+
+    printf -v "${key}" '%s' "${raw}"
+    export "${key}"
+    rewrite_lines+=("${key}=$(shell_quote_env_value "${raw}")")
+  done < "${ENV_FILE}"
+
+  # Always rewrite with safe quoting so manual `source` and future loads stay clean.
+  local tmp
+  tmp="$(mktemp)"
+  if ((${#rewrite_lines[@]} > 0)); then
+    printf '%s\n' "${rewrite_lines[@]}" > "${tmp}"
+  else
+    : > "${tmp}"
+  fi
+  mv "${tmp}" "${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
+  if (( healed == 1 )); then
+    log_file "Healed/rewrote env sheet ${ENV_FILE} with shell-safe quoting"
+  fi
 }
 
 container_exists() {
