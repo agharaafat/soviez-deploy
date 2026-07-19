@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
-SOVIEZ_SCRIPT_VERSION="v0.1.1"
+SOVIEZ_SCRIPT_VERSION="v0.1.2"
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
@@ -490,6 +490,304 @@ require_cmd() {
     ui_error "Required command not found: $1"
     exit 1
   fi
+  # Docker must be responsive, not merely installed (v0.1.2 self-heal).
+  if [[ "$1" == "docker" ]]; then
+    ensure_docker_responsive || {
+      ui_error "Docker engine remains unresponsive after automatic recovery."
+      exit 1
+    }
+  fi
+}
+
+# ===========================================================================
+# Self-healing architecture (v0.1.2) — detect, troubleshoot, fix, resume
+# ===========================================================================
+
+# True when an apt/dpkg lock file is held or a package manager PID is live.
+_apt_lock_held() {
+  local f pid
+  for f in \
+      /var/lib/dpkg/lock-frontend \
+      /var/lib/dpkg/lock \
+      /var/lib/apt/lists/lock \
+      /var/cache/apt/archives/lock; do
+    [[ -e "${f}" ]] || continue
+    if command -v fuser >/dev/null 2>&1; then
+      if fuser "${f}" >/dev/null 2>&1; then
+        return 0
+      fi
+    elif command -v lsof >/dev/null 2>&1; then
+      if lsof "${f}" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+  done
+  if pgrep -x apt >/dev/null 2>&1 \
+      || pgrep -x apt-get >/dev/null 2>&1 \
+      || pgrep -x dpkg >/dev/null 2>&1 \
+      || pgrep -f 'unattended-upgrade' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# Clear stuck apt/dpkg locks so package installs can resume.
+heal_apt_locks() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1 && ! command -v dpkg >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! _apt_lock_held; then
+    return 0
+  fi
+
+  ui_warn "APT/DPKG lock detected — waiting 5s for background upgrades to finish..."
+  sleep 5
+  if ! _apt_lock_held; then
+    ui_ok "APT locks cleared after brief wait"
+    return 0
+  fi
+
+  ui_warn "APT still locked — forcefully clearing package-manager holders..."
+  log_file "WARN heal_apt_locks: killing apt/apt-get/dpkg and removing lock files"
+  killall -9 apt apt-get dpkg unattended-upgrade 2>/dev/null || true
+  sleep 1
+  rm -f \
+    /var/lib/dpkg/lock-frontend \
+    /var/lib/dpkg/lock \
+    /var/lib/apt/lists/lock \
+    /var/cache/apt/archives/lock \
+    /var/lib/dpkg/lock-frontend.lock \
+    2>/dev/null || true
+
+  export DEBIAN_FRONTEND=noninteractive
+  dpkg --configure -a >>"${LOG_FILE}" 2>&1 || true
+  ui_ok "APT/DPKG lock healer finished — resuming package operations"
+  return 0
+}
+
+# Non-blocking docker CLI probe; restart the daemon if hung/frozen.
+ensure_docker_responsive() {
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local probe_rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 docker ps >/dev/null 2>&1
+    probe_rc=$?
+  else
+    # Fallback when timeout(1) is missing — short background race.
+    (
+      docker ps >/dev/null 2>&1
+    ) &
+    local pid=$!
+    local i=0
+    while (( i < 30 )); do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}"
+        probe_rc=$?
+        break
+      fi
+      sleep 0.1
+      i=$((i + 1))
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -9 "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+      probe_rc=124
+    fi
+  fi
+
+  # 0 = healthy; 124/137 = timeout/killed hang; other = daemon error
+  if (( probe_rc == 0 )); then
+    return 0
+  fi
+
+  ui_warn "Docker engine is unresponsive. Attempting automatic recovery..."
+  log_file "WARN ensure_docker_responsive: docker ps rc=${probe_rc} — systemctl restart docker"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart docker >>"${LOG_FILE}" 2>&1 || true
+  else
+    service docker restart >>"${LOG_FILE}" 2>&1 || true
+  fi
+
+  local i
+  for i in $(seq 1 10); do
+    if command -v timeout >/dev/null 2>&1; then
+      if timeout 2 docker ps >/dev/null 2>&1; then
+        ui_ok "Docker engine responsive after recovery"
+        return 0
+      fi
+    elif docker ps >/dev/null 2>&1; then
+      ui_ok "Docker engine responsive after recovery"
+      return 0
+    fi
+    sleep 1
+  done
+  ui_error "Docker engine still unresponsive after restart"
+  return 1
+}
+
+# Best-effort PID listening on a TCP port (ss preferred, netstat fallback).
+port_listener_pid() {
+  local port="$1"
+  local line pid=""
+  if command -v ss >/dev/null 2>&1; then
+    line="$(ss -ltnp 2>/dev/null | awk -v p=":${port}" '
+      $4 ~ p"$" || $4 ~ "\\[::\\]:" p"$" || $4 ~ "0\\.0\\.0\\.0:" p"$" {
+        print; exit
+      }')"
+    pid="$(printf '%s' "${line}" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2 || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    line="$(netstat -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" { print; exit }')"
+    pid="$(printf '%s' "${line}" | awk '{print $7}' | cut -d/ -f1 | grep -E '^[0-9]+$' | head -n1 || true)"
+  fi
+  printf '%s\n' "${pid}"
+}
+
+# Free Nginx (80/443) or tenant ports held by orphans / unmanaged services.
+resolve_port_collisions() {
+  local port pid state cmd base
+  for port in "$@"; do
+    [[ -n "${port}" ]] || continue
+    if ! is_port_busy "${port}"; then
+      continue
+    fi
+
+    pid="$(port_listener_pid "${port}")"
+    if [[ -z "${pid}" || ! "${pid}" =~ ^[0-9]+$ ]]; then
+      ui_warn "Port ${port} busy but holder PID unknown — will re-allocate/skip if possible"
+      log_file "WARN resolve_port_collisions: port=${port} holder unknown"
+      continue
+    fi
+
+    state="$(ps -o state= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+    cmd="$(ps -o comm= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+    base="${cmd##*/}"
+
+    # Zombie / vanished process — force-reap.
+    if [[ "${state}" == Z* ]] || [[ ! -d "/proc/${pid}" ]]; then
+      ui_warn "Port ${port}: zombie/orphan PID ${pid} — killing"
+      kill -9 "${pid}" 2>/dev/null || true
+      sleep 0.3
+      continue
+    fi
+
+    # Never kill Docker / our own ERP stack holders — caller re-allocates instead.
+    case "${base}" in
+      docker*|containerd*|dockerd|soviez*)
+        ui_warn "Port ${port} held by ${base} (pid ${pid}) — leaving intact; reallocating if needed"
+        log_file "WARN resolve_port_collisions: skip managed holder port=${port} pid=${pid} cmd=${base}"
+        continue
+        ;;
+    esac
+
+    # Unmanaged HTTP stacks that commonly steal 80/443 from Nginx.
+    case "${base}" in
+      apache2|httpd|httpds|lighttpd|caddy|traefik|nginx)
+        # If systemd nginx is healthy and this is the master, keep it (we need it).
+        if [[ "${base}" == "nginx" ]] && systemctl is-active --quiet nginx 2>/dev/null; then
+          log_file "INFO resolve_port_collisions: port=${port} owned by active nginx — OK"
+          continue
+        fi
+        ui_warn "Port ${port} hogged by unmanaged ${base} (pid ${pid}) — terminating to free the bind"
+        kill -TERM "${pid}" 2>/dev/null || true
+        sleep 1
+        if is_port_busy "${port}"; then
+          kill -9 "${pid}" 2>/dev/null || true
+          sleep 0.3
+        fi
+        if is_port_busy "${port}"; then
+          ui_warn "Port ${port} still busy after kill — continuing with best-effort allocation"
+        else
+          ui_ok "Port ${port} freed (was ${base})"
+        fi
+        ;;
+      *)
+        ui_warn "Port ${port} held by ${base:-unknown} (pid ${pid}) — leaving process; will re-allocate tenant ports"
+        log_file "WARN resolve_port_collisions: unmanaged non-http holder port=${port} pid=${pid} cmd=${base}"
+        ;;
+    esac
+  done
+  return 0
+}
+
+# nginx -t gate: never reload a broken tree; isolate the suspect site and recover.
+safe_nginx_reload() {
+  local suspect="${1:-}"
+  local base enabled stamp f
+
+  if ! command -v nginx >/dev/null 2>&1; then
+    return 0
+  fi
+  ensure_log_file
+
+  if nginx -t >>"${LOG_FILE}" 2>&1; then
+    systemctl reload nginx >>"${LOG_FILE}" 2>&1 || systemctl start nginx >>"${LOG_FILE}" 2>&1 || true
+    return 0
+  fi
+
+  ui_error "Tenant config syntax broken, rolling back..."
+  log_file "ERROR safe_nginx_reload: nginx -t failed; suspect=${suspect:-auto-scan}"
+
+  stamp="$(date +%s)"
+  if [[ -n "${suspect}" && -e "${suspect}" ]]; then
+    mv -f "${suspect}" "${suspect}.bak.${stamp}" 2>/dev/null \
+      || mv -f "${suspect}" "${suspect}.bak" 2>/dev/null || true
+    base="$(basename "${suspect}")"
+    enabled="/etc/nginx/sites-enabled/${base}"
+    rm -f "${enabled}" 2>/dev/null || true
+    log_file "WARN safe_nginx_reload: isolated ${suspect} → .bak.${stamp}"
+  else
+    # Peel newest tenant sites until the tree validates again.
+    while IFS= read -r f; do
+      [[ -n "${f}" && -f "${f}" ]] || continue
+      mv -f "${f}" "${f}.bak.${stamp}" 2>/dev/null || true
+      rm -f "/etc/nginx/sites-enabled/$(basename "${f}")" 2>/dev/null || true
+      log_file "WARN safe_nginx_reload: trial-isolated ${f}"
+      if nginx -t >>"${LOG_FILE}" 2>&1; then
+        ui_warn "Isolated broken Nginx site: ${f}"
+        break
+      fi
+    done < <(ls -t /etc/nginx/sites-available/soviez-*.conf 2>/dev/null | head -n 8 || true)
+  fi
+
+  if nginx -t >>"${LOG_FILE}" 2>&1; then
+    systemctl reload nginx >>"${LOG_FILE}" 2>&1 || systemctl start nginx >>"${LOG_FILE}" 2>&1 || true
+    ui_warn "Nginx reloaded with surviving stable configurations"
+    return 0
+  fi
+
+  ui_error "Nginx still failing after rollback — see ${LOG_FILE}"
+  return 1
+}
+
+# Tight readiness loop before web boot / migrations (default 30s).
+wait_for_db_readiness() {
+  local timeout_s="${1:-30}"
+  local i
+
+  ensure_docker_responsive || true
+  if [[ -z "${DB_CONTAINER:-}" ]]; then
+    ui_error "wait_for_db_readiness: DB_CONTAINER unset"
+    return 1
+  fi
+
+  ui_wait "Waiting for PostgreSQL to accept connections (up to ${timeout_s}s)..."
+  for i in $(seq 1 "${timeout_s}"); do
+    if docker exec "${DB_CONTAINER}" pg_isready -U soviez -d postgres >/dev/null 2>&1; then
+      ui_ok "PostgreSQL accepting connections (${DB_CONTAINER})"
+      return 0
+    fi
+    sleep 1
+  done
+
+  ui_error "PostgreSQL did not become ready within ${timeout_s}s. Inspect: docker logs ${DB_CONTAINER}"
+  return 1
 }
 
 # Spinner + silent command runner (stdout/stderr → log)
@@ -505,6 +803,11 @@ show_progress() {
   ensure_log_file
   ui_wait "${message}"
   log_file "EXEC  ${cmd[*]}"
+
+  # Self-heal apt locks before any package-manager invocation (v0.1.2).
+  if [[ "${cmd[*]}" == *apt-get* ]] || [[ "${cmd[*]}" == *apt\ * ]]; then
+    heal_apt_locks
+  fi
 
   # Run in a subshell so shell functions work; keep spinner on TTY.
   (
@@ -629,12 +932,16 @@ find_free_host_port() {
   local port="${start}"
   while (( port <= PORT_SCAN_MAX )); do
     if is_port_busy "${port}"; then
-      log_file "Port ${port} busy — probing next"
-      port=$((port + 1))
-    else
-      echo "${port}"
-      return 0
+      # Attempt to free zombie/orphan holders before skipping (v0.1.2).
+      resolve_port_collisions "${port}"
+      if is_port_busy "${port}"; then
+        log_file "Port ${port} busy — probing next"
+        port=$((port + 1))
+        continue
+      fi
     fi
+    echo "${port}"
+    return 0
   done
   ui_error "No free TCP port in range ${start}-${PORT_SCAN_MAX}."
   return 1
@@ -960,6 +1267,7 @@ docker_volume_exists() {
 }
 
 ensure_network_and_volumes() {
+  ensure_docker_responsive || return 1
   if docker_network_exists "${NETWORK_NAME}"; then
     log_file "Network ${NETWORK_NAME} already exists"
   else
@@ -1007,15 +1315,8 @@ resume_network_and_volumes() {
 }
 
 wait_for_postgres() {
-  local i
-  for i in $(seq 1 45); do
-    if docker exec "${DB_CONTAINER}" pg_isready -U soviez -d postgres >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  ui_error "PostgreSQL did not become ready. Inspect: docker logs ${DB_CONTAINER}"
-  return 1
+  # Compatibility alias — tight 30s readiness loop (v0.1.2).
+  wait_for_db_readiness 30
 }
 
 # Detect the NUL-squash bug: CMD became "postgres-cshared_buffers=…" (single token).
@@ -1644,6 +1945,9 @@ start_web_container() {
   ensure_custom_addons_dir
   ensure_tenant_soviez_conf
   ensure_migration_secret || return 1
+  ensure_docker_responsive || return 1
+  # Delay web boot until Postgres explicitly accepts connections (v0.1.2).
+  wait_for_db_readiness 30 || return 1
 
   if (( force == 1 )) && container_exists "${WEB_CONTAINER}"; then
     docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
@@ -2111,7 +2415,7 @@ docker_network_rm_soft() {
 
 reload_nginx_soft() {
   if command -v nginx >/dev/null 2>&1; then
-    nginx -t >>"${LOG_FILE}" 2>&1 && systemctl reload nginx >>"${LOG_FILE}" 2>&1 || true
+    safe_nginx_reload "" || true
   fi
 }
 
@@ -2446,6 +2750,7 @@ EOF
 # Back-compat alias used by --init progress helper.
 configure_nginx_global_limits() {
   ensure_nginx_global_limits
+  # Global limits are not a tenant site — test+reload without tenant isolation.
   if ! nginx -t >>"${LOG_FILE}" 2>&1; then
     ui_error "Nginx configuration test failed after writing ${NGINX_LIMITS_CONF}"
     return 1
@@ -2472,6 +2777,7 @@ ssl_le_privkey_path() {
 # Guarantee Certbot's nginx authenticator/installer plugin is present and loadable.
 ensure_certbot_nginx_plugin() {
   export DEBIAN_FRONTEND=noninteractive
+  heal_apt_locks
   ui_wait "Ensuring Certbot nginx plugin (python3-certbot-nginx)..."
   if ! command -v certbot >/dev/null 2>&1; then
     apt-get install -y certbot python3-certbot-nginx >>"${LOG_FILE}" 2>&1 || {
@@ -2491,6 +2797,7 @@ ensure_certbot_nginx_plugin() {
 
   if ! printf '%s' "${plugins}" | grep -Eiq '(^|[[:space:]])nginx([[:space:]]|$)|\* nginx'; then
     ui_warn "Certbot nginx plugin not loaded — force-reinstalling python3-certbot-nginx..."
+    heal_apt_locks
     apt-get install -y --reinstall python3-certbot-nginx certbot >>"${LOG_FILE}" 2>&1 || {
       ui_error "Force-reinstall of python3-certbot-nginx failed — see ${LOG_FILE}"
       return 1
@@ -2710,11 +3017,16 @@ EOF
   rm -f /etc/nginx/sites-enabled/000-default 2>/dev/null || true
   mkdir -p /var/www/html
 
-  if ! nginx -t >>"${LOG_FILE}" 2>&1; then
-    ui_error "Nginx site config failed for ${domain} — see ${LOG_FILE}"
+  resolve_port_collisions 80 443
+  if ! safe_nginx_reload "${site_file}"; then
+    ui_error "Nginx site config failed for ${domain} — rolled back; see ${LOG_FILE}"
     return 1
   fi
-  systemctl reload nginx >>"${LOG_FILE}" 2>&1 || systemctl start nginx >>"${LOG_FILE}" 2>&1 || true
+  # If the suspect was rolled back to .bak, the live site is gone — treat as failure.
+  if [[ ! -f "${site_file}" ]]; then
+    ui_error "Nginx site for ${domain} was isolated after syntax failure"
+    return 1
+  fi
   log_file "Wrote Nginx site ${site_file} ssl_kind=${ssl_kind} bind=${bind_ip} tenant=${tenant_token} crt=${crt_file}"
 }
 
@@ -3038,6 +3350,7 @@ install_docker_engine() {
     if [[ "${major}" =~ ^[0-9]+$ ]] && (( major >= 20 )); then
       ui_ok "Docker ${ver} already installed"
       systemctl enable --now docker >>"${LOG_FILE}" 2>&1 || true
+      ensure_docker_responsive || ui_warn "Docker enable succeeded but CLI still flaky — continuing"
       return 0
     fi
     ui_warn "Docker ${ver} is outdated — upgrading via official convenience script..."
@@ -3051,6 +3364,10 @@ install_docker_engine() {
       exit 1
     }
   systemctl enable --now docker >>"${LOG_FILE}" 2>&1
+  ensure_docker_responsive || {
+    ui_error "Docker installed but unresponsive after enable — see ${LOG_FILE}"
+    exit 1
+  }
   ui_ok "Docker Engine ready"
 }
 
@@ -3288,6 +3605,10 @@ mode_init() {
     "Containers are NOT launched in this mode." \
     "After success, provision tenants with: ./soviez.sh --new"
 
+  # Self-heal common host blockers before mutating packages / binds (v0.1.2).
+  resolve_port_collisions 80 443
+  heal_apt_locks
+
   # Refresh package indexes only — do not apt-upgrade the host (avoids breaking changes).
   show_progress "Refreshing apt package indexes..." apt-get update -y || {
       ui_error "apt-get update failed — see ${LOG_FILE}"
@@ -3340,6 +3661,9 @@ mode_new() {
     ui_error "Host not initialized. Run first: sudo ./soviez.sh --init"
     exit 1
   fi
+
+  # Free 80/443 orphans before DNS/Nginx provisioning (v0.1.2).
+  resolve_port_collisions 80 443
 
   local public_ip next_index
   public_ip="$(detect_public_ip)"
@@ -4275,7 +4599,7 @@ run_odoo_neutralize() {
 }
 
 # ===========================================================================
-# Isolated staging runtime (v0.1.1+) — stage.<domain> + dbfilter lock
+# Isolated staging runtime (v0.1.2+) — stage.<domain> + dbfilter lock
 # ===========================================================================
 stage_web_container_name() {
   printf '%s-stage\n' "${WEB_CONTAINER}"
@@ -4311,7 +4635,7 @@ ensure_stage_soviez_conf() {
 
   cat > "${conf_path}" <<EOF
 [options]
-; Isolated staging runtime — managed by soviez.sh --stage (v0.1.1+)
+; Isolated staging runtime — managed by soviez.sh --stage (v0.1.2+)
 ; list_db stays False; dbfilter auto-loads ONLY the cloned stage database.
 workers = 0
 limit_memory_soft = 2147483648
@@ -4343,9 +4667,7 @@ teardown_stage_runtime() {
   if [[ -n "${stage_domain}" ]]; then
     ui_wait "Removing Nginx site for ${stage_domain}..."
     remove_nginx_site_for_domain "${stage_domain}"
-    if command -v nginx >/dev/null 2>&1; then
-      nginx -t >>"${LOG_FILE}" 2>&1 && systemctl reload nginx >>"${LOG_FILE}" 2>&1 || true
-    fi
+    safe_nginx_reload "" || true
     ui_ok "Nginx stage vhost cleared"
   fi
 
@@ -4452,6 +4774,8 @@ _docker_run_stage_web_container() {
 launch_stage_web_container() {
   local stage_web
   stage_web="$(stage_web_container_name)"
+  ensure_docker_responsive || return 1
+  wait_for_db_readiness 30 || return 1
   if container_exists "${stage_web}"; then
     docker rm -f "${stage_web}" >>"${LOG_FILE}" 2>&1 || true
   fi
