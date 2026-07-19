@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
-SOVIEZ_SCRIPT_VERSION="v0.1.2"
+SOVIEZ_SCRIPT_VERSION="v0.1.3"
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
@@ -449,9 +449,10 @@ log_file() {
   printf '[%s] %s\n' "${ts}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
-ui_info()  { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; log_file "INFO  $*"; }
-ui_ok()    { echo -e "${C_GREEN}[OK]${C_RESET}   $*"; log_file "OK    $*"; }
-ui_warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; log_file "WARN  $*"; }
+# Status lines always go to stderr so command substitutions ($(...)) stay clean.
+ui_info()  { echo -e "${C_CYAN}[INFO]${C_RESET} $*" >&2; log_file "INFO  $*"; }
+ui_ok()    { echo -e "${C_GREEN}[OK]${C_RESET}   $*" >&2; log_file "OK    $*"; }
+ui_warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $*" >&2; log_file "WARN  $*"; }
 ui_error() { echo -e "${C_RED}[ERROR]${C_RESET} $*" >&2; log_file "ERROR $*"; }
 
 # Non-blocking Debian/Ubuntu security-update hint (never runs apt upgrade).
@@ -465,18 +466,18 @@ hint_os_security_updates() {
   local now mtime age
   now="$(date +%s 2>/dev/null || printf '0\n')"
   if [[ ! -f "${stamp}" ]]; then
-    echo -e "\e[33m[HINT] Your Linux OS has pending security updates. It is highly recommended to run 'apt update && apt upgrade -y' to secure your host server.\e[0m"
+    echo -e "\e[33m[HINT] Your Linux OS has pending security updates. It is highly recommended to run 'apt update && apt upgrade -y' to secure your host server.\e[0m" >&2
     return 0
   fi
 
   mtime="$(stat -c %Y "${stamp}" 2>/dev/null || stat -f %m "${stamp}" 2>/dev/null || printf '0\n')"
   age=$((now - mtime))
   if (( age > 7 * 86400 )); then
-    echo -e "\e[33m[HINT] Your Linux OS has pending security updates. It is highly recommended to run 'apt update && apt upgrade -y' to secure your host server.\e[0m"
+    echo -e "\e[33m[HINT] Your Linux OS has pending security updates. It is highly recommended to run 'apt update && apt upgrade -y' to secure your host server.\e[0m" >&2
   fi
   return 0
 }
-ui_wait()  { echo -e "${C_BLUE}[WAIT]${C_RESET} $*"; log_file "WAIT  $*"; }
+ui_wait()  { echo -e "${C_BLUE}[WAIT]${C_RESET} $*" >&2; log_file "WAIT  $*"; }
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -815,12 +816,12 @@ show_progress() {
   ) >>"${LOG_FILE}" 2>&1 &
   pid=$!
 
-  if [[ -t 1 ]]; then
+  if [[ -t 2 ]]; then
     while kill -0 "${pid}" 2>/dev/null; do
-      printf '\r%s[WAIT]%s %s %s' "${C_BLUE}" "${C_RESET}" "${message}" "${spin:i++%${#spin}:1}"
+      printf '\r%s[WAIT]%s %s %s' "${C_BLUE}" "${C_RESET}" "${message}" "${spin:i++%${#spin}:1}" >&2
       sleep 0.12
     done
-    printf '\r\033[K'
+    printf '\r\033[K' >&2
   fi
 
   set +e
@@ -927,9 +928,22 @@ is_port_busy() {
   return 1
 }
 
+# Extract a single valid TCP port from polluted capture (ui noise / multiline).
+sanitize_host_port() {
+  local raw="${1:-}"
+  local port=""
+  port="$(printf '%s' "${raw}" | tr -d '\r' | grep -oE '[0-9]{2,5}' | tail -n1 || true)"
+  if [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+    printf '%s\n' "${port}"
+    return 0
+  fi
+  return 1
+}
+
 find_free_host_port() {
   local start="${1:-${PORT_SCAN_START}}"
   local port="${start}"
+  # stdout must remain ONLY the port — ui_* already goes to stderr (v0.1.3).
   while (( port <= PORT_SCAN_MAX )); do
     if is_port_busy "${port}"; then
       # Attempt to free zombie/orphan holders before skipping (v0.1.2).
@@ -940,7 +954,7 @@ find_free_host_port() {
         continue
       fi
     fi
-    echo "${port}"
+    printf '%s\n' "${port}"
     return 0
   done
   ui_error "No free TCP port in range ${start}-${PORT_SCAN_MAX}."
@@ -3698,6 +3712,11 @@ mode_new() {
   SOVIEZ_ADMIN_PASSWORD="$(generate_password)"
   SOVIEZ_MIGRATION_SECRET="$(generate_migration_secret)"
   SOVIEZ_HOST_PORT="$(find_free_host_port "${MULTI_PORT_START}")"
+  SOVIEZ_HOST_PORT="$(sanitize_host_port "${SOVIEZ_HOST_PORT}" 2>/dev/null || true)"
+  if [[ -z "${SOVIEZ_HOST_PORT}" ]]; then
+    ui_error "Failed to allocate a valid tenant host port"
+    exit 1
+  fi
 
   cat > "${ENV_FILE}" <<EOF
 SOVIEZ_INSTANCE_INDEX=${next_index}
@@ -4679,9 +4698,9 @@ teardown_stage_runtime() {
 }
 
 allocate_stage_host_port() {
-  local stage_web existing port_map
+  local stage_web existing port_map chosen=""
   stage_web="$(stage_web_container_name)"
-  existing="${SOVIEZ_STAGE_HOST_PORT:-}"
+  existing="$(sanitize_host_port "${SOVIEZ_STAGE_HOST_PORT:-}" 2>/dev/null || true)"
 
   if [[ -n "${existing}" ]]; then
     if ! is_port_busy "${existing}"; then
@@ -4697,7 +4716,15 @@ allocate_stage_host_port() {
     fi
     ui_warn "Stored stage port ${existing} is busy — allocating a free port"
   fi
-  find_free_host_port "${MULTI_PORT_START}"
+
+  chosen="$(find_free_host_port "${MULTI_PORT_START}" | tail -n1 || true)"
+  chosen="$(sanitize_host_port "${chosen}" 2>/dev/null || true)"
+  if [[ -z "${chosen}" ]]; then
+    ui_error "Could not allocate a clean host port for staging"
+    return 1
+  fi
+  printf '%s\n' "${chosen}"
+  return 0
 }
 
 # Dedicated staging web runner — shares Postgres/filestore network, locks DB via dbfilter.
@@ -4707,10 +4734,20 @@ _docker_run_stage_web_container() {
   local run_rc=0
 
   stage_web="$(stage_web_container_name)"
-  stage_port="${SOVIEZ_STAGE_HOST_PORT}"
-  stage_mac="${SOVIEZ_STAGE_CONTAINER_MAC}"
+  stage_port="$(sanitize_host_port "${SOVIEZ_STAGE_HOST_PORT:-}" 2>/dev/null || true)"
+  stage_mac="${SOVIEZ_STAGE_CONTAINER_MAC:-}"
   dbfilter_re="^${STAGE_DB_NAME}$"
   runtime_conf="$(stage_soviez_conf_path)"
+
+  if [[ -z "${stage_port}" ]]; then
+    ui_error "Invalid SOVIEZ_STAGE_HOST_PORT='${SOVIEZ_STAGE_HOST_PORT:-}' — expected a TCP port"
+    return 1
+  fi
+  SOVIEZ_STAGE_HOST_PORT="${stage_port}"
+  if [[ -z "${stage_mac}" ]]; then
+    ui_error "SOVIEZ_STAGE_CONTAINER_MAC is unset"
+    return 1
+  fi
 
   ensure_host_ledger_dir
   ensure_custom_addons_dir
@@ -4896,6 +4933,11 @@ mode_stage() {
   dns_validation_loop "${public_ip}" "${stage_domain}"
 
   SOVIEZ_STAGE_HOST_PORT="$(allocate_stage_host_port)"
+  SOVIEZ_STAGE_HOST_PORT="$(sanitize_host_port "${SOVIEZ_STAGE_HOST_PORT}" 2>/dev/null || true)"
+  if [[ -z "${SOVIEZ_STAGE_HOST_PORT}" ]]; then
+    ui_error "Failed to allocate a valid staging host port"
+    exit 1
+  fi
   if [[ -z "${SOVIEZ_STAGE_CONTAINER_MAC:-}" ]]; then
     SOVIEZ_STAGE_CONTAINER_MAC="$(generate_mac)"
   fi
