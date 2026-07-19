@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
-SOVIEZ_SCRIPT_VERSION="v0.1.6"
+SOVIEZ_SCRIPT_VERSION="v0.1.7"
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
@@ -1587,6 +1587,16 @@ list_db = False
 EOF
     chmod 640 "${conf_path}"
     log_file "Created tenant runtime tenant.soviez.conf at ${conf_path}"
+  fi
+
+  # Persist DB DSN into conf so docker exec CLI (neutralize/update) does not rely on argv-only secrets.
+  if [[ -n "${DB_CONTAINER:-}" ]]; then
+    conf_set_option "${conf_path}" "db_host" "${DB_CONTAINER}"
+    conf_set_option "${conf_path}" "db_port" "5432"
+    conf_set_option "${conf_path}" "db_user" "${DB_APP_USER:-soviez}"
+  fi
+  if [[ -n "${SOVIEZ_DB_PASSWORD:-}" ]]; then
+    conf_set_option "${conf_path}" "db_password" "${SOVIEZ_DB_PASSWORD}"
   fi
 }
 
@@ -4708,8 +4718,16 @@ run_odoo_neutralize() {
     -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
     -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
   )
+  local db_user db_pass net_for_oneshot stage_web stage_conf
 
   assert_safe_dbname "${dbname}"
+  db_user="${DB_APP_USER:-soviez}"
+  db_pass="${SOVIEZ_DB_PASSWORD:-}"
+  if [[ -z "${db_pass}" ]]; then
+    ui_error "SOVIEZ_DB_PASSWORD unset — cannot neutralize ${dbname}"
+    return 1
+  fi
+
   ensure_host_ledger_dir
   if [[ -n "${CUSTOM_ADDONS_HOST_PATH}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
     volume_args+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
@@ -4718,12 +4736,20 @@ run_odoo_neutralize() {
 
   ui_wait "Running native neutralization on database ${dbname}..."
   ensure_migration_secret || return 1
-  # Prefer one-shot maintenance container (same pattern as --update); avoids -u odoo if absent.
+
+  # Prefer tenant bridge for one-shot; stage DB can also use stage net once DB is attached.
+  net_for_oneshot="${NETWORK_NAME}"
+  if [[ "${dbname}" == "${STAGE_DB_NAME:-stage}" ]]; then
+    ensure_stage_docker_network
+    net_for_oneshot="${STAGE_NETWORK_NAME}"
+  fi
+
+  # Prefer one-shot maintenance container with explicit DSN (never rely on bare conf defaults).
   if docker run --rm \
-      --network "${NETWORK_NAME}" \
-      -e POSTGRES_USER="${DB_APP_USER}" \
-      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+      --network "${net_for_oneshot}" \
+      -e POSTGRES_USER="${db_user}" \
+      -e POSTGRES_PASSWORD="${db_pass}" \
+      -e PASSWORD="${db_pass}" \
       -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
       "${volume_args[@]}" \
       "${APP_IMAGE}" \
@@ -4731,8 +4757,8 @@ run_odoo_neutralize() {
         --addons-path="${addons_cli}" \
         --db_host="${DB_CONTAINER}" \
         --db_port=5432 \
-        --db_user="${DB_APP_USER}" \
-        --db_password="${SOVIEZ_DB_PASSWORD}" \
+        --db_user="${db_user}" \
+        --db_password="${db_pass}" \
         --data-dir=/root/.local/share/Odoo \
         --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
         -d "${dbname}" --neutralize --stop-after-init >>"${LOG_FILE}" 2>&1; then
@@ -4740,15 +4766,34 @@ run_odoo_neutralize() {
     return 0
   fi
 
-  # Fallback: exec into live web runner if present
+  # Fallback A: exec into staging web (conf now embeds DSN) when neutralizing stage DB.
+  stage_web="$(stage_web_container_name 2>/dev/null || true)"
+  stage_conf="/opt/soviez-erp/tenant.soviez.conf"
+  if [[ "${dbname}" == "${STAGE_DB_NAME:-stage}" ]] && [[ -n "${stage_web}" ]] && container_running "${stage_web}"; then
+    ui_warn "Maintenance neutralize failed — retrying via docker exec ${stage_web}..."
+    if docker exec "${stage_web}" \
+        python3 soviez-bin neutralize \
+          -c "${stage_conf}" \
+          -d "${dbname}" \
+          --db_host="${DB_CONTAINER}" \
+          --db_port=5432 \
+          --db_user="${db_user}" \
+          --db_password="${db_pass}" \
+          --stop-after-init >>"${LOG_FILE}" 2>&1; then
+      ui_ok "Neutralize completed via ${stage_web}"
+      return 0
+    fi
+  fi
+
+  # Fallback B: exec into live production web runner if present.
   if container_running "${WEB_CONTAINER}"; then
     ui_warn "Maintenance neutralize failed — retrying via docker exec ${WEB_CONTAINER}..."
     if docker exec "${WEB_CONTAINER}" \
-        python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+        python3 soviez-bin -c /opt/soviez-erp/tenant.soviez.conf \
           --db_host="${DB_CONTAINER}" \
           --db_port=5432 \
-          --db_user="${DB_APP_USER}" \
-          --db_password="${SOVIEZ_DB_PASSWORD}" \
+          --db_user="${db_user}" \
+          --db_password="${db_pass}" \
           --data-dir=/root/.local/share/Odoo \
           -d "${dbname}" --neutralize --stop-after-init >>"${LOG_FILE}" 2>&1; then
       ui_ok "Neutralize completed via ${WEB_CONTAINER}"
@@ -4948,10 +4993,10 @@ remove_stage_custom_addons_dir() {
   return 0
 }
 
-# Stage conf keeps list_db=False globally and pins dbfilter to the cloned DB only.
+# Stage conf: dbfilter lock + full DB DSN so neutralize/CLI work without argv-only secrets.
 ensure_stage_soviez_conf() {
   local dbname="$1"
-  local conf_path dir dbfilter_re addons_line
+  local conf_path dir dbfilter_re addons_line db_user db_pass db_host
   assert_safe_dbname "${dbname}"
   conf_path="$(stage_soviez_conf_path)"
   dir="$(dirname "${conf_path}")"
@@ -4964,10 +5009,19 @@ ensure_stage_soviez_conf() {
     addons_line="${addons_line},${CUSTOM_ADDONS_CONTAINER_PATH}"
   fi
 
+  db_host="${DB_CONTAINER}"
+  db_user="${DB_APP_USER:-soviez}"
+  db_pass="${SOVIEZ_DB_PASSWORD:-}"
+  if [[ -z "${db_pass}" ]]; then
+    ui_error "SOVIEZ_DB_PASSWORD unset — cannot write stage tenant.soviez.conf DB DSN"
+    return 1
+  fi
+
   cat > "${conf_path}" <<EOF
 [options]
-; Isolated staging runtime — managed by soviez.sh --stage (v0.1.3+)
+; Isolated staging runtime — managed by soviez.sh --stage (v0.1.7+)
 ; list_db stays False; dbfilter auto-loads ONLY the cloned stage database.
+; DB DSN is embedded so docker exec neutralize/CLI works without re-passing argv secrets.
 ; Custom addons bind is the isolated host *_stage tree (not production).
 workers = 0
 limit_memory_soft = 2147483648
@@ -4976,9 +5030,13 @@ addons_path = ${addons_line}
 data_dir = /root/.local/share/Odoo
 list_db = False
 dbfilter = ${dbfilter_re}
+db_host = ${db_host}
+db_port = 5432
+db_user = ${db_user}
+db_password = ${db_pass}
 EOF
   chmod 640 "${conf_path}"
-  log_file "Wrote stage runtime conf ${conf_path} dbfilter=${dbfilter_re}"
+  log_file "Wrote stage runtime conf ${conf_path} dbfilter=${dbfilter_re} db_host=${db_host}"
 }
 
 # Tear down stage web + Nginx + isolated addons sandbox (does not touch Postgres / filestore / prod addons).
@@ -5239,7 +5297,10 @@ mode_stage() {
     exit 1
   fi
 
-  # ---- Step D: neutralize + staging SQL fail-safe (UUID rotate, assets purge) ----
+  # ---- Step D: neutralize + staging SQL fail-safe (identity keys kept; assets purged) ----
+  # Write stage conf early so DSN exists for neutralize / later docker exec.
+  ensure_stage_custom_addons_dir || true
+  ensure_stage_soviez_conf "${STAGE_DB_NAME}" || exit 1
   if ! run_odoo_neutralize "${STAGE_DB_NAME}"; then
     ui_warn "Native neutralize failed — applying SQL fail-safe only"
   fi
