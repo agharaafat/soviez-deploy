@@ -27,6 +27,7 @@ set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
 SOVIEZ_SCRIPT_VERSION="v0.1.8"
+# Installer tag v0.1.8: neutralize subcommand + embedded stage DB DSN.
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
