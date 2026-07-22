@@ -16,7 +16,8 @@
 #   ./soviez.sh --change-domain <tenant>   Repoint tenant DNS/Nginx/HTTPS to a new domain
 #   ./soviez.sh --monitor              Live docker stats for running soviez-* containers
 #   ./soviez.sh --logs <tenant>        Stream docker logs for the tenant web container
-#   ./soviez.sh --update               Pull soviez/soviez-erp:latest and recycle web runners
+#   ./soviez.sh --update [web]         Pull latest image; recycle all web runners (prod + stage),
+#                                      or only the named container (e.g. soviez-web-1 / soviez-web-1-stage)
 #   ./soviez.sh --formworkers <tenant>   Auto-tune Odoo workers, PG buffers, Docker limits
 #   ./soviez.sh --purge <tenant>         Irreversibly destroy a tenant (containers, volumes, configs)
 #   ./soviez.sh --rebuild <tenant>       Wipe DB + filestore; keep domain, env, and custom addons
@@ -26,8 +27,8 @@
 set -euo pipefail
 
 # Installer version — bumped when soviez.sh behavior changes. Used by update_self().
-SOVIEZ_SCRIPT_VERSION="v0.1.8"
-# Installer tag v0.1.8: neutralize subcommand + embedded stage DB DSN.
+SOVIEZ_SCRIPT_VERSION="v0.1.9"
+# Installer tag v0.1.9: prod dbfilter lock + --update covers stage / optional web target.
 
 # Public installer sources (soviez-erp raw GitHub is private and 404s without auth).
 readonly SOVIEZ_SH_UPDATE_URLS=(
@@ -182,6 +183,7 @@ LOGS_TENANT_REF=""
 FORMWORKERS_TENANT_REF=""
 PURGE_TENANT_REF=""
 REBUILD_TENANT_REF=""
+UPDATE_TARGET_REF=""
 # Resource tuning outputs (set by compute_allocation_for_tenant)
 WORKERS=""
 LIMIT_SOFT_BYTES=""
@@ -299,7 +301,9 @@ Usage:
   ./soviez.sh --change-domain <tenant>       Repoint tenant to a new domain (DNS + Nginx + SSL)
   ./soviez.sh --monitor                      Live docker stats for running soviez-* containers
   ./soviez.sh --logs <tenant>                Follow tenant web container logs
-  ./soviez.sh --update                       Pull latest ERP image and recycle web containers
+  ./soviez.sh --update [web]                 Pull latest ERP image and recycle web runners
+                                             (default: all prod + stage). Optional: soviez-web-1
+                                             or soviez-web-1-stage to update one container only.
   ./soviez.sh --formworkers <tenant>         Tune Odoo workers, PostgreSQL buffers, Docker limits
   ./soviez.sh --purge <tenant>               Irreversibly destroy tenant (containers, volumes, configs)
   ./soviez.sh --rebuild <tenant>             Wipe DB + filestore; keep domain, env, custom addons
@@ -321,6 +325,9 @@ Examples:
   sudo ./soviez.sh --change-domain 2
   sudo ./soviez.sh --monitor
   sudo ./soviez.sh --logs soviez-web-1
+  sudo ./soviez.sh --update
+  sudo ./soviez.sh --update soviez-web-1
+  sudo ./soviez.sh --update soviez-web-1-stage
   sudo ./soviez.sh --formworkers soviez-web-1
   sudo ./soviez.sh --rebuild soviez-web-1
   sudo ./soviez.sh --purge soviez-web-1
@@ -374,6 +381,8 @@ USAGE
         PURGE_TENANT_REF="${clean_arg}"
       elif [[ "${MODE}" == "rebuild" && -z "${REBUILD_TENANT_REF}" ]]; then
         REBUILD_TENANT_REF="${clean_arg}"
+      elif [[ "${MODE}" == "update" && -z "${UPDATE_TARGET_REF}" ]]; then
+        UPDATE_TARGET_REF="${clean_arg}"
       else
         echo "[ERROR] Unknown argument: ${arg}" >&2
         echo "[ERROR] Try: ./soviez.sh --help" >&2
@@ -398,6 +407,12 @@ fi
 if [[ "${MODE}" == "dropstage" ]]; then
   if [[ -n "${DROPSTAGE_TENANT_REF}" && "${DROPSTAGE_TENANT_REF}" =~ ^[0-9]+$ ]]; then
     DROPSTAGE_TENANT_REF="soviez-web-${DROPSTAGE_TENANT_REF}"
+  fi
+fi
+# --update optional target: expand bare indexes to production web names.
+if [[ "${MODE}" == "update" && -n "${UPDATE_TARGET_REF}" ]]; then
+  if [[ "${UPDATE_TARGET_REF}" =~ ^[0-9]+$ ]]; then
+    UPDATE_TARGET_REF="soviez-web-${UPDATE_TARGET_REF}"
   fi
 fi
 
@@ -1579,6 +1594,7 @@ ensure_tenant_soviez_conf() {
     cat > "${conf_path}" <<EOF
 [options]
 ; Per-tenant runtime — managed by soviez.sh (--new auto-config / --formworkers)
+; list_db stays False; dbfilter auto-loads ONLY this tenant's application database.
 workers = 0
 limit_memory_soft = 2147483648
 limit_memory_hard = 2684354560
@@ -1598,6 +1614,17 @@ EOF
   fi
   if [[ -n "${SOVIEZ_DB_PASSWORD:-}" ]]; then
     conf_set_option "${conf_path}" "db_password" "${SOVIEZ_DB_PASSWORD}"
+  fi
+
+  # Monodb lock: with a staging clone on the same Postgres, production MUST filter
+  # or Odoo redirects to /web/database/selector (list_db=False → dead-end UI).
+  local prod_dbname prod_dbfilter
+  prod_dbname="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
+  if [[ -n "${prod_dbname}" ]]; then
+    prod_dbfilter="^${prod_dbname}$"
+    conf_set_option "${conf_path}" "list_db" "False"
+    conf_set_option "${conf_path}" "dbfilter" "${prod_dbfilter}"
+    conf_set_option "${conf_path}" "db_name" "${prod_dbname}"
   fi
 }
 
@@ -2026,11 +2053,15 @@ _docker_run_web_container() {
   local addons_cli runtime_conf
   local -a volume_args=() docker_limits=()
   local run_rc=0
+  local prod_dbname prod_dbfilter
 
   ensure_host_ledger_dir
   ensure_custom_addons_dir
   ensure_tenant_soviez_conf
   runtime_conf="$(tenant_soviez_conf_path)"
+
+  prod_dbname="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
+  prod_dbfilter="^${prod_dbname}$"
 
   volume_args+=(
     -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
@@ -2066,6 +2097,7 @@ _docker_run_web_container() {
     -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e PASSWORD="${SOVIEZ_DB_PASSWORD}" \
     -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
+    -e "_SOVIEZ_PROD_DBFILTER=${prod_dbfilter}" \
     "${docker_limits[@]}" \
     "${volume_args[@]}" \
     "${APP_IMAGE}" \
@@ -2076,7 +2108,8 @@ _docker_run_web_container() {
       --db_user=soviez \
       --db_password="${SOVIEZ_DB_PASSWORD}" \
       --data-dir=/root/.local/share/Odoo \
-      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" >>"${LOG_FILE}" 2>&1
+      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
+      --db-filter="${prod_dbfilter}" >>"${LOG_FILE}" 2>&1
   run_rc=$?
   set -e
 
@@ -2177,22 +2210,68 @@ purge_frontend_assets() {
         OR name ILIKE '%.assets_%.min.css';" >/dev/null
 }
 
-run_schema_upgrades() {
-  local dbname
-  local dbs
-  local count=0
-  local upgrade_rc=0
+run_schema_upgrade_for_db() {
+  local dbname="$1"
+  local custom_addons_host="${2:-}"
   local addons_cli="/opt/soviez-erp/addons,/opt/soviez-erp/odoo/addons"
   local -a volume_args=(
     -v "${FILESTORE_VOLUME}:/root/.local/share/Odoo/filestore"
     -v "${HOST_SOVIEZ_DIR}:/root/.soviez"
   )
+  local upgrade_rc=0
+
+  [[ -z "${dbname}" ]] && return 1
+  if [[ ! "${dbname}" =~ ^[A-Za-z0-9_:-]+$ ]]; then
+    ui_error "Refusing unsafe database name: ${dbname}"
+    return 1
+  fi
 
   ensure_host_ledger_dir
-  if [[ -n "${CUSTOM_ADDONS_HOST_PATH}" && -d "${CUSTOM_ADDONS_HOST_PATH}" ]]; then
-    volume_args+=(-v "${CUSTOM_ADDONS_HOST_PATH}:${CUSTOM_ADDONS_CONTAINER_PATH}")
+  if [[ -z "${custom_addons_host}" ]]; then
+    custom_addons_host="${CUSTOM_ADDONS_HOST_PATH:-}"
+  fi
+  if [[ -n "${custom_addons_host}" && -d "${custom_addons_host}" ]]; then
+    volume_args+=(-v "${custom_addons_host}:${CUSTOM_ADDONS_CONTAINER_PATH}")
     addons_cli="${addons_cli},${CUSTOM_ADDONS_CONTAINER_PATH}"
   fi
+
+  ensure_migration_secret || return 1
+
+  set +e
+  docker run --rm \
+    --network "${NETWORK_NAME}" \
+    --mac-address "${SOVIEZ_CONTAINER_MAC}" \
+    -e POSTGRES_USER=soviez \
+    -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
+    -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
+    "${volume_args[@]}" \
+    "${APP_IMAGE}" \
+    python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
+      --addons-path="${addons_cli}" \
+      --db_host="${DB_CONTAINER}" \
+      --db_port=5432 \
+      --db_user=soviez \
+      --db_password="${SOVIEZ_DB_PASSWORD}" \
+      --data-dir=/root/.local/share/Odoo \
+      --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
+      -d "${dbname}" \
+      -u "${UPGRADE_MODULES}" \
+      --stop-after-init >>"${LOG_FILE}" 2>&1
+  upgrade_rc=$?
+  set -e
+  if (( upgrade_rc != 0 )); then
+    ui_error "Schema upgrade failed for '${dbname}' (exit ${upgrade_rc})."
+    return "${upgrade_rc}"
+  fi
+  purge_frontend_assets "${dbname}" || return 1
+  log_file "Upgraded database ${dbname}"
+  return 0
+}
+
+run_schema_upgrades() {
+  local dbname
+  local dbs
+  local count=0
 
   mapfile -t dbs < <(list_odoo_databases)
   if ((${#dbs[@]} == 0)); then
@@ -2200,42 +2279,10 @@ run_schema_upgrades() {
     return 0
   fi
 
-  ensure_migration_secret || return 1
-
   for dbname in "${dbs[@]}"; do
     [[ -z "${dbname}" ]] && continue
-    if [[ ! "${dbname}" =~ ^[A-Za-z0-9_:-]+$ ]]; then
-      ui_error "Refusing unsafe database name: ${dbname}"
-      return 1
-    fi
     count=$((count + 1))
-    set +e
-    docker run --rm \
-      --network "${NETWORK_NAME}" \
-      --mac-address "${SOVIEZ_CONTAINER_MAC}" \
-      -e POSTGRES_USER=soviez \
-      -e POSTGRES_PASSWORD="${SOVIEZ_DB_PASSWORD}" \
-      -e SOVIEZ_MIGRATION_SECRET="${SOVIEZ_MIGRATION_SECRET}" \
-      "${volume_args[@]}" \
-      "${APP_IMAGE}" \
-      python3 soviez-bin -c /opt/soviez-erp/soviez.conf \
-        --addons-path="${addons_cli}" \
-        --db_host="${DB_CONTAINER}" \
-        --db_port=5432 \
-        --db_user=soviez \
-        --db_password="${SOVIEZ_DB_PASSWORD}" \
-        --data-dir=/root/.local/share/Odoo \
-        --admin-passwd="${SOVIEZ_ADMIN_PASSWORD}" \
-        -d "${dbname}" \
-        -u "${UPGRADE_MODULES}" \
-        --stop-after-init >>"${LOG_FILE}" 2>&1
-    upgrade_rc=$?
-    set -e
-    if (( upgrade_rc != 0 )); then
-      ui_error "Schema upgrade failed for '${dbname}' (exit ${upgrade_rc})."
-      return "${upgrade_rc}"
-    fi
-    purge_frontend_assets "${dbname}" || return 1
+    run_schema_upgrade_for_db "${dbname}" || return $?
   done
   log_file "Upgraded ${count} database(s)"
 }
@@ -4275,8 +4322,90 @@ mode_formssl() {
 }
 
 # ===========================================================================
-# MODE: update — pull image + recycle web runners (all envs)
+# MODE: update — pull image + recycle web runners (prod + stage; optional target)
 # ===========================================================================
+# Recycle one production web runner: conf dbfilter lock → schema → relaunch.
+update_production_web_unit() {
+  local prod_dbname
+  prod_dbname="${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}"
+
+  resolve_custom_addons_host_path
+  ensure_tenant_soviez_conf
+
+  ui_wait "Stopping web runner ${WEB_CONTAINER}..."
+  docker stop "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+  docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
+
+  if ! show_progress "Schema upgrade ${prod_dbname} (${WEB_CONTAINER})..." \
+      run_schema_upgrade_for_db "${prod_dbname}" "${CUSTOM_ADDONS_HOST_PATH}"; then
+    ui_error "Upgrade aborted for ${WEB_CONTAINER} — left offline. Fix and re-run --update."
+    return 1
+  fi
+
+  show_progress "Relaunching ${WEB_CONTAINER}..." launch_web_container
+  ui_ok "Recycled ${WEB_CONTAINER} on ${APP_IMAGE} (dbfilter=^${prod_dbname}\$)"
+  return 0
+}
+
+# Recycle one staging web runner when stage DB / container metadata exists.
+update_stage_web_unit() {
+  local stage_web stage_db stage_addons stage_mac
+  stage_web="${SOVIEZ_STAGE_WEB_CONTAINER:-$(stage_web_container_name)}"
+  stage_db="${SOVIEZ_STAGE_DB_NAME:-${STAGE_DB_NAME}}"
+  stage_addons="${SOVIEZ_STAGE_ADDONS_HOST:-${STAGE_ADDONS_HOST_PATH:-}}"
+  stage_mac="${SOVIEZ_STAGE_CONTAINER_MAC:-}"
+
+  if [[ -z "${stage_web}" ]]; then
+    ui_warn "No staging web name for ${WEB_CONTAINER} — skipping stage update"
+    return 0
+  fi
+
+  if ! pg_database_exists "${stage_db}"; then
+    ui_warn "Staging database '${stage_db}' not found — skipping ${stage_web}"
+    return 0
+  fi
+
+  if [[ -z "${SOVIEZ_STAGE_HOST_PORT:-}" ]]; then
+    if container_exists "${stage_web}"; then
+      SOVIEZ_STAGE_HOST_PORT="$(
+        docker port "${stage_web}" 8069 2>/dev/null | head -n1 | sed -E 's/.*://' || true
+      )"
+    fi
+  fi
+  if [[ -z "${SOVIEZ_STAGE_HOST_PORT:-}" ]]; then
+    ui_error "SOVIEZ_STAGE_HOST_PORT unset — cannot relaunch ${stage_web}. Re-run --stage or set the env key."
+    return 1
+  fi
+
+  if [[ -z "${stage_mac}" ]]; then
+    stage_mac="$(resolve_production_web_mac 2>/dev/null || true)"
+    stage_mac="${stage_mac:-${SOVIEZ_CONTAINER_MAC:-}}"
+  fi
+  if [[ -z "${stage_mac}" ]]; then
+    ui_error "Cannot resolve stage MAC for ${stage_web}"
+    return 1
+  fi
+  SOVIEZ_STAGE_CONTAINER_MAC="${stage_mac}"
+  STAGE_ADDONS_HOST_PATH="${stage_addons}"
+
+  ensure_stage_docker_network
+  ensure_stage_soviez_conf "${stage_db}" || return 1
+
+  ui_wait "Stopping staging web ${stage_web}..."
+  docker stop "${stage_web}" >>"${LOG_FILE}" 2>&1 || true
+  docker rm -f "${stage_web}" >>"${LOG_FILE}" 2>&1 || true
+
+  if ! show_progress "Schema upgrade ${stage_db} (${stage_web})..." \
+      run_schema_upgrade_for_db "${stage_db}" "${stage_addons}"; then
+    ui_error "Upgrade aborted for ${stage_web} — left offline. Fix and re-run --update ${stage_web}."
+    return 1
+  fi
+
+  show_progress "Relaunching ${stage_web}..." launch_stage_web_container
+  ui_ok "Recycled ${stage_web} on ${APP_IMAGE} (dbfilter=^${stage_db}\$)"
+  return 0
+}
+
 mode_update() {
   ensure_log_file
   hint_os_security_updates
@@ -4286,6 +4415,10 @@ mode_update() {
 
   local env_path
   local -a env_files=()
+  local target_kind=""
+  local target_web=""
+  local updated=0
+  local failed=0
 
   # Indexed tenants
   shopt -s nullglob
@@ -4307,6 +4440,16 @@ mode_update() {
     exit 1
   fi
 
+  if [[ -n "${UPDATE_TARGET_REF}" ]]; then
+    target_kind="$(update_target_kind "${UPDATE_TARGET_REF}")"
+    target_web="${UPDATE_TARGET_REF,,}"
+    target_web="${target_web//_/-}"
+    target_web="$(strip_trailing_hyphens "${target_web}")"
+    ui_info "Targeted update: ${target_web} (${target_kind})"
+  else
+    ui_info "Updating all tenants (production + staging where present)"
+  fi
+
   show_progress "Pulling ${APP_IMAGE}..." docker pull "${APP_IMAGE}"
 
   local processed=()
@@ -4326,7 +4469,7 @@ mode_update() {
     processed+=("${real}")
 
     ENV_FILE="${env_path}"
-    ui_info "Updating instance from ${ENV_FILE}"
+    ui_info "Loading instance from ${ENV_FILE}"
     load_env_file
     require_complete_env
 
@@ -4339,30 +4482,80 @@ mode_update() {
     CUSTOM_ADDONS_HOST_PATH="${SOVIEZ_CUSTOM_ADDONS_HOST:-}"
     resolve_custom_addons_host_path
 
+    local stage_web_name
+    stage_web_name="${SOVIEZ_STAGE_WEB_CONTAINER:-$(stage_web_container_name)}"
+
+    # Targeted update: skip tenants that do not own the requested web name.
+    if [[ -n "${target_web}" ]]; then
+      if [[ "${target_kind}" == "production" && "${target_web}" != "${WEB_CONTAINER}" ]]; then
+        continue
+      fi
+      if [[ "${target_kind}" == "stage" && "${target_web}" != "${stage_web_name}" ]]; then
+        continue
+      fi
+    fi
+
     if ! container_running "${DB_CONTAINER}"; then
       if container_exists "${DB_CONTAINER}"; then
         docker start "${DB_CONTAINER}" >/dev/null
       else
         ui_error "Database container '${DB_CONTAINER}' missing — skip ${ENV_FILE}"
+        failed=$((failed + 1))
         continue
       fi
     fi
-    wait_for_postgres || continue
-
-    ui_wait "Stopping web runner ${WEB_CONTAINER}..."
-    docker stop "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
-    docker rm -f "${WEB_CONTAINER}" >>"${LOG_FILE}" 2>&1 || true
-
-    if ! show_progress "Schema upgrade (${WEB_CONTAINER})..." run_schema_upgrades; then
-      ui_error "Upgrade aborted for ${WEB_CONTAINER} — left offline. Fix and re-run --update."
+    wait_for_postgres || {
+      failed=$((failed + 1))
       continue
+    }
+
+    local do_prod=0 do_stage=0
+    if [[ -z "${target_web}" ]]; then
+      do_prod=1
+      if [[ -n "${SOVIEZ_STAGE_WEB_CONTAINER:-}" ]] || container_exists "${stage_web_name}"; then
+        do_stage=1
+      elif pg_database_exists "${SOVIEZ_STAGE_DB_NAME:-${STAGE_DB_NAME}}"; then
+        # Stage DB left behind without container metadata — still upgrade + relaunch if ports known.
+        if [[ -n "${SOVIEZ_STAGE_HOST_PORT:-}" ]]; then
+          do_stage=1
+        fi
+      fi
+    elif [[ "${target_kind}" == "production" ]]; then
+      do_prod=1
+    elif [[ "${target_kind}" == "stage" ]]; then
+      do_stage=1
     fi
 
-    show_progress "Relaunching ${WEB_CONTAINER}..." launch_web_container
-    ui_ok "Recycled ${WEB_CONTAINER} on ${APP_IMAGE}"
+    if (( do_prod == 1 )); then
+      if update_production_web_unit; then
+        updated=$((updated + 1))
+      else
+        failed=$((failed + 1))
+      fi
+    fi
+
+    if (( do_stage == 1 )); then
+      if update_stage_web_unit; then
+        updated=$((updated + 1))
+      else
+        failed=$((failed + 1))
+      fi
+    fi
   done
 
-  print_green_success "Update complete — web runners recycled on ${APP_IMAGE}"
+  if [[ -n "${target_web}" && ${updated} -eq 0 && ${failed} -eq 0 ]]; then
+    ui_error "No matching web runner for '${UPDATE_TARGET_REF}'. Try: --update | --update soviez-web-1 | --update soviez-web-1-stage"
+    exit 1
+  fi
+
+  if (( failed > 0 )); then
+    print_green_success "Update finished with errors — recycled ${updated}, failed ${failed} (see ${LOG_FILE})"
+    echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
+    echo ""
+    exit 1
+  fi
+
+  print_green_success "Update complete — recycled ${updated} web runner(s) on ${APP_IMAGE}"
   echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
   echo ""
 }
@@ -4442,6 +4635,15 @@ parse_tenant_index_from_ref() {
     printf '%s\n' "${ref}"
     return 0
   fi
+  # Staging web names resolve to the parent tenant index.
+  if [[ "${ref}" =~ ^soviez-web-([0-9]+)-stage$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${ref}" == "soviez-web-stage" ]]; then
+    printf '%s\n' "primary"
+    return 0
+  fi
   if [[ "${ref}" =~ ^soviez-web-([0-9]+)$ ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
     return 0
@@ -4459,6 +4661,23 @@ parse_tenant_index_from_ref() {
     return 0
   fi
   return 1
+}
+
+# Classify an --update target: prints "production" or "stage" (empty target → empty).
+update_target_kind() {
+  local ref="${1:-}"
+  ref="$(strip_trailing_hyphens "${ref}")"
+  ref="${ref,,}"
+  ref="${ref//_/-}"
+  if [[ -z "${ref}" ]]; then
+    printf '\n'
+    return 0
+  fi
+  if [[ "${ref}" =~ -stage$ ]] || [[ "${ref}" == "soviez-web-stage" ]]; then
+    printf 'stage\n'
+    return 0
+  fi
+  printf 'production\n'
 }
 
 load_tenant_topology_from_ref() {
@@ -5368,12 +5587,13 @@ mode_stage() {
   print_ssl_status_report "${stage_domain}"
 
   print_green_success "Staging ready: ${STAGE_DB_NAME} → https://${stage_domain}"
-  echo -e "  Production web: ${C_BOLD}${WEB_CONTAINER}${C_RESET} (list_db=False — unchanged)"
+  echo -e "  Production web: ${C_BOLD}${WEB_CONTAINER}${C_RESET} (list_db=False + dbfilter=^${SOVIEZ_DB_NAME:-${DEFAULT_APP_DB_NAME}}\$)"
   echo -e "  Staging web:    ${C_BOLD}${stage_web}${C_RESET} → 127.0.0.1:${SOVIEZ_STAGE_HOST_PORT}"
   echo -e "  License MAC:    ${C_BOLD}${SOVIEZ_STAGE_CONTAINER_MAC}${C_RESET} on ${C_CYAN}${STAGE_NETWORK_NAME}${C_RESET}"
   echo -e "  Addons sandbox: ${C_BOLD}${STAGE_ADDONS_HOST_PATH:-${SOVIEZ_STAGE_ADDONS_HOST:-n/a}}${C_RESET}"
   echo -e "  DB lock:        ${C_CYAN}_SOVIEZ_DBFILTER=${dbfilter_re}${C_RESET} + conf dbfilter"
   echo -e "  Drop later:     ${C_BOLD}sudo ./soviez.sh --dropstage ${STAGE_TENANT_REF} ${STAGE_DB_NAME}${C_RESET}"
+  echo -e "  Update both:    ${C_BOLD}sudo ./soviez.sh --update${C_RESET}  (or --update ${stage_web})"
   echo -e "  Inventory:      ${C_BOLD}sudo ./soviez.sh --liststage${C_RESET}"
   echo -e "  Log: ${C_DIM}${LOG_FILE}${C_RESET}"
   echo ""
